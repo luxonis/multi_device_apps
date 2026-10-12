@@ -1,0 +1,108 @@
+Luxonis Proprietary Software License
+
+SPDX-License-Identifier: LicenseRef-Luxonis-Proprietary
+
+Copyright (c) 2024-2026 Luxonis Holding Corporation. All rights reserved.
+
+1. Definitions
+
+   "Licensor" means Luxonis Holding Corporation.
+
+   "Software" means the software programs, object code, bundled assets, and
+   accompanying documentation distributed by Licensor under this License,
+   including the OAK Viewer desktop application, the Viewer web application,
+   the Visualizer web application, and the OAK App container images built from
+   this repository.
+
+   "You" means the individual or legal entity exercising rights under this
+   License.
+
+   "Luxonis Hardware" means camera devices and other hardware products
+   manufactured, sold, or authorized by Licensor.
+
+2. Grant of License
+
+   Subject to Your compliance with this License, Licensor grants You a
+   non-exclusive, non-transferable, non-sublicensable, revocable, worldwide
+   license to install and use the Software solely for the purpose of operating,
+   configuring, evaluating, and developing applications for Luxonis Hardware.
+
+3. Restrictions
+
+   Except to the extent that the following restrictions are prohibited by
+   applicable law or permitted by the license terms of a Third-Party Component
+   as described in Section 5, You may not:
+
+   (a) copy, redistribute, sublicense, sell, rent, lease, or otherwise transfer
+       the Software to any third party;
+
+   (b) modify, adapt, translate, or create derivative works of the Software;
+
+   (c) reverse engineer, decompile, or disassemble the Software, or otherwise
+       attempt to derive its source code;
+
+   (d) remove, obscure, or alter any copyright, trademark, or other proprietary
+       notice contained in the Software; or
+
+   (e) use the Software to develop a competing product or service.
+
+4. Ownership
+
+   The Software is licensed, not sold. Licensor and its licensors retain all
+   right, title, and interest in and to the Software, including all
+   intellectual property rights therein. No rights are granted except as
+   expressly set out in this License.
+
+5. Third-Party Components
+
+   The Software includes third-party components that are licensed under their
+   own terms, including open source licenses. Those terms govern Your use of
+   the corresponding components and, to the extent they conflict with this
+   License, take precedence with respect to those components.
+
+   A list of third-party components and their licenses is distributed with the
+   Software in the accompanying THIRD_PARTY_NOTICES.md file.
+
+   Certain components are licensed under the Mozilla Public License, Version
+   2.0. For those components, Licensor will provide the corresponding Source
+   Code Form on request, at no charge beyond the cost of distribution. Requests
+   may be sent to support@luxonis.com.
+
+6. Feedback
+
+   If You provide Licensor with suggestions or feedback regarding the Software,
+   Licensor may use it without restriction and without obligation to You.
+
+7. Term and Termination
+
+   This License applies until terminated. It terminates automatically if You
+   breach any of its terms. On termination You must cease all use of the
+   Software and destroy all copies in Your possession. Sections 4, 8, 9, and 10
+   survive termination.
+
+8. Disclaimer of Warranty
+
+   THE SOFTWARE IS PROVIDED "AS IS" AND WITHOUT WARRANTY OF ANY KIND, WHETHER
+   EXPRESS, IMPLIED, STATUTORY, OR OTHERWISE, INCLUDING WITHOUT LIMITATION ANY
+   WARRANTY OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, OR
+   NON-INFRINGEMENT. LICENSOR DOES NOT WARRANT THAT THE SOFTWARE WILL BE
+   UNINTERRUPTED OR ERROR-FREE.
+
+9. Limitation of Liability
+
+   TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, LICENSOR SHALL NOT BE
+   LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR EXEMPLARY
+   DAMAGES, OR FOR ANY LOSS OF PROFITS, REVENUE, DATA, OR GOODWILL, ARISING OUT
+   OF OR RELATED TO THIS LICENSE OR THE SOFTWARE, REGARDLESS OF THE THEORY OF
+   LIABILITY AND EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+10. General
+
+    This License constitutes the entire agreement between You and Licensor
+    regarding the Software and supersedes all prior understandings. If any
+    provision is held unenforceable, it shall be reformed only to the extent
+    necessary to make it enforceable, and the remaining provisions remain in
+    effect. Failure to enforce any provision is not a waiver of it.
+
+Luxonis Holding Corporation
+https://luxonis.com

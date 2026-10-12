@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-device</title>
+<style>
+  :root { --bg:#f5f6f8; --panel:#fff; --line:#dfe3e8; --text:#1d232b; --muted:#6b7480; --accent:#5b3cf5; --ok:#1d9a5b; --warn:#c7791a; --err:#c92b2b; }
+  * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
+  body { margin:0; font:14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--text); background:var(--bg); height:100vh; display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; }
+  .dot { width:10px; height:10px; border-radius:50%; background:#aab; }
+  .dot.calibrating, .dot.discovering, .dot.inspecting { background:var(--warn); animation:pulse 1s infinite; }
+  .dot.pointcloud, .dot.panorama { background:var(--ok); animation:pulse 1s infinite; }
+  .dot.error { background:var(--err); }
+  .dot.ptp_password, .dot.distance_input { background:var(--accent); animation:pulse 1s infinite; }
+  .devices .ptp { font-size:11px; padding:1px 6px; border-radius:10px; background:#eef0ff; color:var(--accent); margin-left:6px; }
+  .devices .ptp.off { background:#fdecec; color:var(--err); }
+  .warning { padding:10px 12px; border-radius:6px; background:#fff4e5; color:#8a5200; border:1px solid #f3d9a4; }
+  .modal-backdrop { position:fixed; inset:0; background:rgba(20,24,30,.55); display:flex; align-items:center; justify-content:center; z-index:10; }
+  .modal { background:var(--panel); border-radius:10px; padding:20px 22px; width:min(560px, 94vw); max-height:92vh; overflow:auto; box-shadow:0 20px 60px rgba(0,0,0,.35); }
+  .modal h3 { margin:0 0 6px; font-size:16px; }
+  .modal p { margin:0 0 12px; color:var(--muted); font-size:13px; }
+  .modal .row { display:flex; align-items:center; gap:10px; margin:6px 0; }
+  .modal .row label { width:120px; font-family:ui-monospace, Menlo, monospace; font-size:13px; }
+  .modal .row.dist label { width:auto; flex:1; font-size:12.5px; }
+  .modal input[type=password], .modal input[type=number] { flex:1; font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; }
+  .modal input[type=number] { flex:0 0 110px; }
+  .modal .same { font-size:13px; color:var(--muted); margin:10px 0 14px; display:flex; gap:8px; align-items:center; }
+  .modal .actions { justify-content:flex-end; margin-top:12px; }
+  @keyframes pulse { 50% { opacity:.4 } }
+  main { flex:1; display:grid; grid-template-columns:400px 1fr; min-height:0; }
+  aside { background:var(--panel); border-right:1px solid var(--line); padding:14px 16px; overflow:auto; display:flex; flex-direction:column; gap:14px; }
+  section h2, details.fold h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 8px; display:flex; align-items:center; }
+  section h2 button { margin-left:auto; }
+  .devices { display:flex; flex-direction:column; gap:2px; max-height:300px; overflow:auto; border:1px solid var(--line); border-radius:6px; padding:6px; }
+  .devices .row { display:flex; flex-direction:column; padding:4px 6px; border-radius:4px; }
+  .devices .row:hover { background:var(--bg); }
+  .devices label { display:flex; gap:6px; align-items:center; white-space:nowrap; }
+  .devices label.off { color:var(--muted); }
+  .devices .meta { margin-left:auto; font-size:12px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; }
+  .devices .cal { font-size:11px; padding:1px 6px; border-radius:10px; background:#e8f7ee; color:var(--ok); flex-shrink:0; }
+  .devices .mode { display:flex; align-items:center; gap:6px; margin:3px 0 0 22px; font-size:12px; color:var(--muted); }
+  .devices .mode select { font:inherit; font-size:12px; padding:2px 4px; border:1px solid var(--line); border-radius:4px; background:var(--panel); color:var(--text); max-width:230px; }
+  .actions { display:flex; gap:8px; flex-wrap:wrap; }
+  button { font:inherit; padding:8px 12px; border-radius:6px; border:1px solid var(--line); background:var(--panel); cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.danger { color:var(--err); border-color:var(--err); }
+  button:disabled { opacity:.45; cursor:default; }
+  button.small { padding:3px 8px; font-size:12px; }
+  .option { font-size:12.5px; color:var(--muted); display:flex; gap:6px; align-items:center; margin-top:8px; }
+  .status-card { border-radius:8px; background:var(--bg); border-left:5px solid #aab; padding:12px 14px; display:flex; flex-direction:column; gap:8px; }
+  .status-card.calibrating, .status-card.ptp_password, .status-card.distance_input, .status-card.inspecting { border-left-color:var(--warn); background:#fff7ea; }
+  .status-card.discovering { border-left-color:var(--accent); background:#f1efff; }
+  .status-card.pointcloud, .status-card.panorama { border-left-color:var(--ok); background:#eef9f2; }
+  .status-card.error { border-left-color:var(--err); background:#fdecec; }
+  .status-card .phase { display:flex; align-items:center; gap:8px; font-weight:600; font-size:14px; }
+  .status-card.error .message { color:var(--err); }
+  .bar-wrap { display:flex; flex-direction:column; gap:4px; }
+  .bar-label { display:flex; justify-content:space-between; font-size:12.5px; color:var(--muted); }
+  .bar-label b { color:var(--text); font-size:14px; }
+  .bar { height:16px; border-radius:8px; background:#dfe3e8; overflow:hidden; }
+  .bar .fill { height:100%; width:0; background:var(--accent); border-radius:8px; transition:width .4s ease; }
+  .bar .fill.busy { width:100% !important; background:repeating-linear-gradient(45deg, var(--accent) 0 12px, #9d8cff 12px 24px); background-size:34px 34px; animation:slide 1s linear infinite; }
+  @keyframes slide { from { background-position:0 0 } to { background-position:34px 0 } }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  td, th { padding:3px 4px; border-bottom:1px solid var(--line); vertical-align:top; text-align:left; }
+  th { color:var(--muted); font-weight:500; font-size:11.5px; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  td:first-child { white-space:nowrap; }
+  .kv td:first-child { color:var(--muted); }
+  .chip { display:inline-block; font-size:11px; padding:1px 7px; border-radius:10px; background:#eef0ff; color:var(--accent); }
+  .chip.good { background:#e8f7ee; color:var(--ok); }
+  .chip.fair { background:#fff4e5; color:var(--warn); }
+  .chip.bad { background:#fdecec; color:var(--err); }
+  .stats { display:flex; flex-wrap:wrap; gap:6px 18px; margin:2px 0 10px; }
+  .stats div { display:flex; flex-direction:column; }
+  .stats b { font-size:17px; font-weight:600; line-height:1.2; }
+  .stats b.good { color:var(--ok); } .stats b.fair { color:var(--warn); } .stats b.bad { color:var(--err); }
+  .stats span { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .metrics table + table { margin-top:8px; }
+  .metrics .title { font-weight:600; margin-bottom:4px; }
+  .metrics .sub { color:var(--muted); font-size:12px; margin-bottom:6px; }
+  details.fold summary { list-style:none; cursor:pointer; user-select:none; }
+  details.fold summary::-webkit-details-marker { display:none; }
+  details.fold summary h2 { margin:0; }
+  details.fold summary h2::before { content:'▸'; display:inline-block; width:14px; font-size:11px; transition:transform .15s; }
+  details.fold[open] summary h2::before { transform:rotate(90deg); }
+  details.fold[open] summary { margin-bottom:8px; }
+  .count { margin-left:6px; font-weight:normal; text-transform:none; letter-spacing:0; }
+  .callist tr { cursor:pointer; }
+  .callist tr.shown td { background:#f1efff; }
+  .log { font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background:#1d232b; color:#d6dde6; border-radius:6px; padding:8px 10px; height:200px; overflow:auto; white-space:pre-wrap; flex-shrink:0; }
+  .spread { position:sticky; bottom:-14px; margin:auto -16px -14px; padding:10px 16px; background:var(--panel); border-top:1px solid var(--line); font-size:12px; display:grid; grid-template-columns:auto 1fr; column-gap:12px; align-items:center; }
+  .spread .label { color:var(--muted); white-space:nowrap; }
+  .spread .value { font:600 22px/1 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:nowrap; grid-row:span 2; }
+  .spread .value.good { color:var(--ok); }
+  .spread .value.fair { color:var(--warn); }
+  .spread .value.bad { color:var(--err); }
+  .spread .note { color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .viewer { position:relative; min-height:0; background:#fff; }
+  .viewer canvas { width:100%; height:100%; display:block; cursor:grab; touch-action:none; }
+  .viewer iframe { width:100%; height:100%; border:0; background:#fff; }
+  .viewer .pano { width:100%; height:100%; object-fit:contain; background:#1d232b; display:block; }
+  .option select { font:inherit; font-size:12.5px; padding:2px 4px; border:1px solid var(--line); border-radius:4px; background:var(--panel); color:var(--text); }
+  .viewer canvas:active { cursor:grabbing; }
+  .viewtools { position:absolute; top:10px; right:12px; display:flex; gap:6px; align-items:center; background:rgba(255,255,255,.92); border:1px solid var(--line); border-radius:8px; padding:6px 8px; font-size:12px; }
+  .viewtools label { display:flex; gap:4px; align-items:center; color:var(--muted); }
+  .guide { position:absolute; inset:0; background:var(--bg); display:flex; align-items:center; justify-content:center; padding:24px; }
+  .guide .card { max-width:540px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:28px 32px; box-shadow:0 10px 30px rgba(0,0,0,.08); }
+  .guide h3 { margin:0 0 10px; font-size:20px; }
+  .guide p { margin:0 0 8px; color:var(--muted); font-size:15px; line-height:1.5; }
+  .guide ol { margin:8px 0 0; padding-left:22px; font-size:15px; line-height:1.7; }
+  .guide .spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--line); border-top-color:var(--accent); border-radius:50%; animation:spin .9s linear infinite; vertical-align:-2px; margin-right:8px; }
+  @keyframes spin { to { transform:rotate(360deg) } }
+  .previews { position:absolute; inset:0; background:#1d232b; padding:12px; overflow:auto; display:grid; gap:10px; align-content:start; }
+  .previews figure { margin:0; background:#000; border-radius:6px; overflow:hidden; position:relative; aspect-ratio:16/10; }
+  .previews img { width:100%; height:100%; object-fit:contain; display:block; }
+  .previews figcaption { position:absolute; left:0; bottom:0; padding:3px 8px; font-size:12px; color:#fff; background:rgba(0,0,0,.55); border-top-right-radius:6px; }
+  .previews .title { grid-column:1 / -1; color:#d6dde6; font-size:13px; }
+  @media (max-width: 900px) { main { grid-template-columns:1fr; grid-template-rows:auto 60vh; } aside { border-right:0; border-bottom:1px solid var(--line); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Multi-device <span id="version" style="font-weight:normal;color:var(--muted);font-size:13px;margin-left:6px"></span></h1>
+</header>
+<main>
+  <aside>
+    <section>
+      <h2>Devices <span class="count" id="devCount"></span><button class="small" id="refresh">Refresh</button></h2>
+      <div class="devices" id="devices"><em style="color:var(--muted)">Searching...</em></div>
+    </section>
+    <section>
+      <div class="actions">
+        <button id="inspect">Check devices</button>
+        <button class="primary" id="calibrate">Calibrate</button>
+        <button class="danger" id="stop">Stop</button>
+      </div>
+      <div class="actions" style="margin-top:8px">
+        <button class="primary" id="pointcloud" title="Merged point cloud of the selected stereo devices (needs a calibration)">Point cloud</button>
+        <button class="primary" id="panorama" title="Calibrated panorama of one camera per device (needs a calibration)">Panorama</button>
+        <select id="projection" title="Panorama projection surface"><option value="cylindrical">Cylindrical</option><option value="spherical">Spherical</option><option value="perspective">Perspective</option></select>
+      </div>
+      <label class="option" title="Tape-measured distances between camera lens centers. Required when no device uses a stereo pair, optional otherwise."><input type="checkbox" id="askDistances"> Enter measured distances</label>
+    </section>
+    <section>
+      <div class="status-card" id="statusCard">
+        <div class="phase"><span class="dot" id="dot"></span><span id="phase">idle</span></div>
+        <div class="message" id="message"></div>
+        <div class="bar-wrap" id="progress" hidden>
+          <div class="bar-label"><span id="barStage"></span><b id="barPercent"></b></div>
+          <div class="bar"><div class="fill" id="barFill"></div></div>
+          <div class="bar-label"><span id="barDetail"></span></div>
+        </div>
+      </div>
+      <div class="warning" id="ptpWarning" hidden style="margin-top:8px"></div>
+      <div id="ptpInfo" style="margin-top:8px;font-size:12.5px;color:var(--muted)" hidden></div>
+    </section>
+    <section class="metrics" id="liveSection" hidden>
+      <h2 id="liveTitle">Live</h2>
+      <div class="stats" id="liveStats"></div>
+    </section>
+    <section class="metrics" id="metricsSection" hidden>
+      <h2>Result</h2>
+      <div id="metrics"></div>
+    </section>
+    <details class="fold" id="calSection" data-key="calibrations" hidden>
+      <summary><h2>Calibrations <span class="count" id="calCount"></span></h2></summary>
+      <table class="callist" id="calibrations"></table>
+    </details>
+    <details class="fold" id="logSection" data-key="log">
+      <summary><h2>Log</h2></summary>
+      <div class="log" id="log"></div>
+    </details>
+    <div class="spread" id="spread" hidden>
+      <span class="value" id="spreadValue">–</span>
+      <span class="label">Frame timestamp spread</span>
+      <span class="note" id="spreadNote"></span>
+    </div>
+  </aside>
+  <div class="viewer">
+    <canvas id="scene"></canvas>
+    <iframe id="viewer" title="DepthAI visualizer" hidden></iframe>
+    <img class="pano" id="pano" alt="panorama" hidden>
+    <div class="viewtools" id="viewtools">
+      <button class="small" data-view="iso">Reset</button>
+      <button class="small" data-view="top">Top</button>
+      <button class="small" data-view="front">Front</button>
+      <button class="small" data-view="side">Side</button>
+    </div>
+    <div class="previews" id="previews" hidden></div>
+    <div class="guide" id="guide" hidden><div class="card" id="guideCard"></div></div>
+  </div>
+</main>
+<div class="modal-backdrop" id="pwModal" hidden>
+  <div class="modal">
+    <h3>Root password for PTP setup</h3>
+    <p>Needed to configure PTP time sync over ssh (OAK 4 default: <code>oelinux123</code>). Used for this run only, never stored.</p>
+    <div id="pwRows"></div>
+    <label class="same"><input type="checkbox" id="pwSame"> Same password for all devices</label>
+    <div class="actions">
+      <button id="pwSkip">Continue without PTP</button>
+      <button class="primary" id="pwSubmit">Set up PTP</button>
+    </div>
+  </div>
+</div>
+<div class="modal-backdrop" id="distModal" hidden>
+  <div class="modal">
+    <h3>Measured camera distances</h3>
+    <p id="distIntro"></p>
+    <div id="distRows"></div>
+    <div class="actions">
+      <button id="distSkip">Continue without</button>
+      <button class="primary" id="distSubmit">Use these distances</button>
+    </div>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const selected = new Set();
+const modes = {};  // device name -> "stereo" | "single:<SOCKET>" chosen in the list
+let state = null;
+let previewNames = [];
+let previewTimer = null;
+let shownCalibration = null;  // path of the calibration shown in the 3D view and the metrics
+let shownFollowsLatest = true;
+
+// ------------------------------------------------------------------ previews while calibrating
+function renderPreviews(names) {
+  const box = $('previews');
+  if (names.join('|') !== previewNames.join('|')) {
+    previewNames = names;
+    box.innerHTML = '';
+    if (names.length) {
+      const cols = Math.ceil(Math.sqrt(names.length * 1.2));
+      box.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+      const title = document.createElement('div');
+      title.className = 'title';
+      title.textContent = `Calibration streams (${names.length}). Every camera should see the same static, textured scene.`;
+      box.appendChild(title);
+      for (const name of names) {
+        const fig = document.createElement('figure');
+        const img = document.createElement('img');
+        img.dataset.name = name;
+        img.alt = name;
+        const cap = document.createElement('figcaption');
+        cap.textContent = name;
+        fig.append(img, cap);
+        box.appendChild(fig);
+      }
+    }
+  }
+  box.hidden = !names.length;
+  if (names.length && !previewTimer) previewTimer = setInterval(refreshPreviews, 250);
+  if (!names.length && previewTimer) { clearInterval(previewTimer); previewTimer = null; }
+}
+
+function refreshPreviews() {
+  for (const img of $('previews').querySelectorAll('img')) {
+    if (img.dataset.loading) continue;
+    img.dataset.loading = '1';
+    const next = new Image();
+    next.onload = () => { img.src = next.src; delete img.dataset.loading; };
+    next.onerror = () => { delete img.dataset.loading; };
+    next.src = `/api/preview/${encodeURIComponent(img.dataset.name)}?t=${Date.now()}`;
+  }
+}
+
+function selectedDevices() { return [...selected]; }
+
+async function post(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const data = await r.json();
+  if (!r.ok) alert(data.error || 'Request failed');
+  poll();
+}
+
+// ------------------------------------------------------------------ device list
+function modeOptions(info) {
+  const opts = [];
+  if (info.stereoPair) opts.push({ value: 'stereo', label: `${info.stereoPair[0]} + ${info.stereoPair[1]} stereo` });
+  for (const c of info.cameras) {
+    if (!c.calibrated) continue;
+    opts.push({ value: `single:${c.socket}`, label: `${c.socket} only` });
+  }
+  return opts;
+}
+
+let devicesSignature = '';
+function renderDevices(devices, calibrations) {
+  const calibratedIds = new Set(calibrations.flatMap(c => c.deviceIds));
+  const box = $('devices');
+  const busy = state && state.busy && state.phase !== 'discovering';
+  const jobDevices = busy ? new Set(state.jobDevices || []) : null;
+  if (jobDevices && jobDevices.size) { for (const n of jobDevices) selected.add(n); }
+  const shown = jobDevices && jobDevices.size ? devices.filter(d => jobDevices.has(d.name)) : devices;
+  // Rebuild the list only when something in it changed, and never while one of its drop-downs is in use:
+  // the poll runs every second and a rebuild would close the open drop-down
+  const signature = JSON.stringify([shown, [...calibratedIds], busy, [...selected], state.deviceInfo, state.ptp && state.ptp.statuses, modes]);
+  if (signature === devicesSignature) return;
+  if (box.contains(document.activeElement) && document.activeElement.tagName === 'SELECT') return;
+  devicesSignature = signature;
+  if (!devices.length) { box.innerHTML = '<em style="color:var(--muted)">No devices found</em>'; return; }
+  box.innerHTML = '';
+  if (jobDevices && jobDevices.size) {
+    const note = document.createElement('div');
+    note.style.cssText = 'font-size:12px;color:var(--muted);padding:2px 6px 6px';
+    note.textContent = `Showing the ${jobDevices.size} device${jobDevices.size > 1 ? 's' : ''} of the running job`;
+    box.appendChild(note);
+  }
+  for (const d of shown) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const label = document.createElement('label');
+    label.className = d.selectable ? '' : 'off';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.disabled = !d.selectable || busy;
+    cb.checked = selected.has(d.name);
+    cb.onchange = () => { cb.checked ? selected.add(d.name) : selected.delete(d.name); render(state); };
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(d.name));
+    if (calibratedIds.has(d.deviceId)) { const c = document.createElement('span'); c.className = 'cal'; c.textContent = 'calibrated'; c.style.marginLeft = '6px'; c.title = 'part of a stored calibration'; label.appendChild(c); }
+    const st = (state && state.ptp && state.ptp.statuses) ? state.ptp.statuses[d.name] : null;
+    if (st && st.status === 'ok') {
+      const b = document.createElement('span');
+      const on = st.enabled && st.syncFrames;
+      b.className = 'ptp' + (on ? '' : ' off');
+      b.textContent = on ? st.mode : 'PTP off';
+      b.title = on ? `PTP ${st.mode}, frame sync on` : 'PTP disabled on this device';
+      label.appendChild(b);
+    }
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    const info = state.deviceInfo[d.name];
+    meta.textContent = (info ? info.productName : d.deviceId) + (d.platform === 'RVC4' ? '' : ` · ${d.platform}`) + (d.state === 'GATE' ? '' : ` · ${d.state.replace('GATE_', '').toLowerCase()}`);
+    meta.title = d.deviceId;
+    label.appendChild(meta);
+    row.appendChild(label);
+    if (info && selected.has(d.name)) {
+      const mode = document.createElement('div');
+      mode.className = 'mode';
+      const opts = modeOptions(info);
+      if (!opts.length) {
+        mode.textContent = 'no calibrated camera';
+      } else {
+        const sel = document.createElement('select');
+        sel.disabled = busy;
+        for (const o of opts) { const opt = document.createElement('option'); opt.value = o.value; opt.textContent = o.label; sel.appendChild(opt); }
+        if (!(d.name in modes) || !opts.some(o => o.value === modes[d.name])) modes[d.name] = info.defaultMode;
+        sel.value = modes[d.name];
+        sel.onchange = () => { modes[d.name] = sel.value; render(state); };
+        mode.append(sel);
+      }
+      row.appendChild(mode);
+    }
+    box.appendChild(row);
+  }
+}
+
+function hasCalibration(devices) {
+  // A stored calibration covering every selected device (it may contain more devices)
+  const ids = devices.map(n => (state.devices.find(d => d.name === n) || {}).deviceId);
+  return ids.length > 0 && state.calibrations.some(c => ids.every(id => c.deviceIds.includes(id)));
+}
+
+function scaleSource() {
+  // Does the current selection contain a device that will register a stereo pair?
+  return selectedDevices().some(n => { const info = state.deviceInfo[n]; return info && info.stereoPair && (modes[n] || info.defaultMode) === 'stereo'; });
+}
+
+function updateButtons() {
+  if (!state) return;
+  const busy = state.busy;
+  const n = selected.size;
+  const inspected = selectedDevices().filter(d => state.deviceInfo[d]).length;
+  $('devCount').textContent = busy && state.jobDevices && state.jobDevices.length ? `· ${state.jobDevices.length} in use` : n ? `· ${n} selected${inspected ? `, ${inspected} checked` : ''}` : '';
+  $('inspect').disabled = busy || n < 1;
+  $('calibrate').disabled = busy || n < 2;
+  const covered = n >= 2 && hasCalibration(selectedDevices());
+  const stereo = selectedDevices().every(d => !state.deviceInfo[d] || state.deviceInfo[d].stereoPair);
+  $('pointcloud').disabled = busy || !covered || !stereo;
+  $('pointcloud').title = n >= 2 && !covered ? 'Calibrate these devices first' : !stereo ? 'Every device needs a stereo pair' : 'Merged point cloud of the selected devices';
+  $('panorama').disabled = busy || !covered;
+  $('panorama').title = n >= 2 && !covered ? 'Calibrate these devices first' : 'Calibrated panorama of the selected devices';
+  $('projection').disabled = busy;
+  $('stop').disabled = !busy || state.phase === 'discovering';
+  $('refresh').disabled = busy;
+  const needDistances = n >= 2 && inspected === n && !scaleSource();
+  $('askDistances').parentElement.style.color = needDistances ? 'var(--warn)' : '';
+  if (needDistances) $('askDistances').checked = true;
+}
+
+// ------------------------------------------------------------------ status, metrics
+function chip(text, cls) { return `<span class="chip ${cls || ''}">${text}</span>`; }
+function confidenceClass(c) { return c == null ? '' : c >= 0.7 ? 'good' : c >= 0.5 ? 'fair' : 'bad'; }
+function fmt(v, digits) { return v == null ? '–' : Number(v).toFixed(digits); }
+
+function renderMetrics(c) {
+  const box = $('metricsSection');
+  if (!c) { box.hidden = true; return; }
+  box.hidden = false;
+  const stats = [];
+  if (c.confidence != null) stats.push([fmt(c.confidence, 3), 'confidence', 'Data confidence, 0 … 1, higher is better', confidenceClass(c.confidence)]);
+  if (c.sampsonError != null) stats.push([fmt(c.sampsonError, 4), 'Sampson', 'Sampson error in px, lower is better']);
+  if (c.samples != null) stats.push([c.samples, 'samples', `${c.samples} image groups${c.collectSeconds != null ? `, collected in ${c.collectSeconds} s` : ''}`]);
+  if (c.ptp) stats.push([c.ptp.active ? (c.ptp.spreadMs != null ? `${c.ptp.spreadMs} ms` : 'on') : 'off', 'PTP', c.ptp.active ? 'frame timestamp spread between the devices' : 'calibrated without PTP']);
+  if (c.previous && c.previous.maxTranslation_cm != null) stats.push([`${c.previous.maxTranslation_cm} cm / ${c.previous.maxRotation_deg}°`, 'vs previous', `largest pose change against the calibration of ${c.previous.time}`, c.previous.maxTranslation_cm < 2 && c.previous.maxRotation_deg < 1 ? 'good' : 'fair']);
+  let html = `<div class="stats">${stats.map(([v, k, title, cls]) => `<div title="${title}"><b class="${cls || ''}">${v}</b><span>${k}</span></div>`).join('')}</div>`;
+  html += `<table><tr><th>Device</th><th class="num">x, y, z [m]</th><th class="num">dist</th><th class="num">rot</th></tr>`;
+  for (const d of c.devices) {
+    html += `<tr title="${d.deviceId}${d.cameras.length ? ' · ' + d.cameras.map(x => x.socket).join(' + ') : ''}${d.ypr_deg ? ' · yaw/pitch/roll ' + d.ypr_deg.join(' / ') + '°' : ''}"><td>${d.name}${d.isOrigin ? ' ' + chip('origin') : ''}</td><td class="num">${d.translation_m.map(v => v.toFixed(3)).join(', ')}</td><td class="num">${d.distance_m.toFixed(3)} m</td><td class="num">${d.rotation_deg.toFixed(1)}°</td></tr>`;
+  }
+  html += '</table>';
+  // Distances: the measured pairs with their residuals when any were entered, else one origin distance per device pair
+  const measured = (c.pairs || []).flatMap(p => p.cameras.filter(r => r.measured_cm != null));
+  if (measured.length) {
+    html += `<table><tr><th>Measured pair</th><th class="num">calibrated</th><th class="num">measured</th><th class="num">diff</th></tr>`;
+    for (const r of measured) html += `<tr><td style="white-space:normal">${r.a} ↔ ${r.b}</td><td class="num">${fmt(r.distance_cm, 1)} cm</td><td class="num">${fmt(r.measured_cm, 1)} cm</td><td class="num">${(r.residual_cm > 0 ? '+' : '') + fmt(r.residual_cm, 1)} cm</td></tr>`;
+    html += '</table>';
+  } else if (c.pairs && c.pairs.length > 1) {
+    html += `<table><tr><th>Pair</th><th class="num">distance</th></tr>`;
+    for (const p of c.pairs) html += `<tr><td>${p.a} ↔ ${p.b}</td><td class="num">${fmt(p.origin_distance_cm, 1)} cm</td></tr>`;
+    html += '</table>';
+  }
+  if ($('metrics').innerHTML !== html) $('metrics').innerHTML = html;
+}
+
+function render(s) {
+  state = s;
+  if (s.version) $('version').textContent = 'v' + s.version;
+  $('dot').className = 'dot ' + s.phase;
+  $('phase').textContent = { idle: 'Ready', discovering: 'Searching devices', inspecting: 'Checking devices', calibrating: 'Calibrating', ptp_password: 'Waiting for passwords', distance_input: 'Waiting for distances', pointcloud: 'Point cloud', panorama: 'Panorama', error: 'Error' }[s.phase] || s.phase;
+  $('statusCard').className = 'status-card ' + s.phase;
+  $('message').textContent = s.message;
+  const p = $('progress');
+  const pr = s.progress;
+  p.hidden = !pr || s.phase !== 'calibrating';
+  if (pr && s.phase === 'calibrating') {
+    const stage = { inspecting: 'Checking devices', ptp: 'Checking PTP', connecting: 'Connecting to devices', warmup: 'Warming up (exposure)', ptplock: 'Waiting for PTP to lock the frames', collecting: 'Collecting calibration data', solving: 'Solving', stopping: 'Stopping' }[pr.stage] || '';
+    const indeterminate = pr.percent == null;
+    $('barStage').textContent = stage;
+    $('barPercent').textContent = indeterminate ? '' : `${pr.percent}%`;
+    $('barFill').className = 'fill' + (indeterminate ? ' busy' : '');
+    $('barFill').style.width = indeterminate ? '100%' : `${pr.percent}%`;
+    $('barDetail').textContent = pr.stage === 'collecting' || pr.stage === 'solving' ? `${pr.done} of ${pr.total} image groups collected` + (pr.stage === 'collecting' ? `, ${pr.total - pr.done} to go` : '') : (pr.detail || '');
+  }
+  renderDevices(s.devices, s.calibrations);
+  updateButtons();
+  renderPreviews(s.phase === 'calibrating' ? s.previews : []);
+  renderPtp(s);
+  renderDistanceModal(s);
+
+  // Which calibration is shown: the latest result unless the user clicked another stored one
+  if (shownFollowsLatest && s.latestCalibration) shownCalibration = s.latestCalibration;
+  if (!shownCalibration && s.calibrations.length) shownCalibration = s.calibrations[0].path;
+  const shown = s.calibrations.find(c => c.path === shownCalibration) || null;
+  renderMetrics(shown);
+  scene.setCalibration(shown);
+  renderLive(s);
+  renderGuide(s, shown);
+
+  $('calSection').hidden = !s.calibrations.length;
+  $('calCount').textContent = s.calibrations.length ? `(${s.calibrations.length})` : '';
+  const rows = s.calibrations.map(c => `<tr data-path="${c.path}" class="${c.path === shownCalibration ? 'shown' : ''}"><td>${c.time}</td><td>${c.devices.map(d => d.name).join(', ')}${c.confidence != null ? `<br><span style="color:var(--muted)">confidence ${fmt(c.confidence, 3)}, Sampson ${fmt(c.sampsonError, 3)}</span>` : ''}</td></tr>`).join('');
+  if ($('calibrations').innerHTML !== rows) {
+    $('calibrations').innerHTML = rows;
+    for (const tr of $('calibrations').querySelectorAll('tr')) tr.onclick = () => { shownCalibration = tr.dataset.path; shownFollowsLatest = tr.dataset.path === s.latestCalibration; render(state); };
+  }
+  const log = $('log');
+  const atBottom = !$('logSection').open || log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+  log.textContent = s.log.join('\n');
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+
+let panoStreaming = false;
+function renderLive(s) {
+  const pc = s.phase === 'pointcloud', pano = s.phase === 'panorama';
+  const viewer = $('viewer');
+  if (pc && !viewer.src) viewer.src = `${location.protocol}//${location.hostname}:${s.visualizerPort}/`;
+  viewer.hidden = !(pc && s.streaming);
+  const img = $('pano');
+  if (pano && s.streaming && !panoStreaming) { img.src = `/api/panorama.mjpeg?t=${Date.now()}`; panoStreaming = true; }
+  if (!(pano && s.streaming) && panoStreaming) { img.removeAttribute('src'); panoStreaming = false; }
+  img.hidden = !(pano && s.streaming);
+  $('scene').hidden = pc || pano;
+  const box = $('liveSection');
+  box.hidden = !((pc || pano) && s.stats);
+  if (box.hidden) return;
+  const st = s.stats;
+  const stats = pc
+    ? [[`${st.rate}`, 'clouds / s'], [st.points.toLocaleString(), 'points'], [st.origin, 'origin']]
+    : [[`${st.rate}`, 'frames / s'], [`${st.width}×${st.height}`, 'panorama'], [st.projection, 'projection']];
+  $('liveTitle').textContent = pc ? 'Point cloud' : 'Panorama';
+  const html = stats.map(([v, k]) => `<div><b>${v}</b><span>${k}</span></div>`).join('');
+  if ($('liveStats').innerHTML !== html) $('liveStats').innerHTML = html;
+}
+
+function renderSpread(s) {
+  const ptp = s.ptp || {};
+  const box = $('spread');
+  box.hidden = !['calibrating', 'pointcloud', 'panorama'].includes(s.phase) || ptp.spreadMs == null;
+  if (box.hidden) return;
+  const v = $('spreadValue');
+  v.textContent = `${ptp.spreadMs.toFixed(2)} ms`;
+  v.className = 'value ' + (ptp.spreadMs < 5 ? 'good' : ptp.spreadMs < 50 ? 'fair' : 'bad');
+  const stale = ptp.spreadAge != null && ptp.spreadAge > 2;
+  $('spreadNote').textContent = (ptp.active ? 'PTP' : 'no PTP') + (s.phase === 'calibrating' ? ', between all cameras' : ', between the devices') + (stale ? `, last group ${ptp.spreadAge.toFixed(0)} s ago` : '');
+}
+
+function renderGuide(s, shown) {
+  const box = $('guide');
+  const calibrating = s.phase === 'calibrating' && s.previews && s.previews.length;
+  const running = (s.phase === 'pointcloud' || s.phase === 'panorama');
+  const show = !calibrating && !(running && s.streaming) && (!shown || s.busy || s.phase === 'error');
+  box.hidden = !show;
+  $('viewtools').hidden = show || calibrating || running;
+  if (!show) return;
+  let html;
+  const n = selected.size;
+  if (s.phase === 'pointcloud') {
+    html = `<h3><span class="spinner"></span>Starting the point cloud</h3><p>${s.message}</p>`;
+  } else if (s.phase === 'panorama') {
+    html = `<h3><span class="spinner"></span>Starting the panorama</h3><p>${s.message}</p>`;
+  } else if (s.phase === 'calibrating' || s.phase === 'ptp_password' || s.phase === 'distance_input') {
+    html = `<h3><span class="spinner"></span>${s.lastJob === 'pointcloud' ? 'Starting the point cloud' : s.lastJob === 'panorama' ? 'Starting the panorama' : 'Calibrating'}</h3><p>${s.message}</p>`;
+  } else if (s.phase === 'inspecting') {
+    html = `<h3><span class="spinner"></span>Checking devices</h3><p>${s.message}</p>`;
+  } else if (s.phase === 'discovering') {
+    html = `<h3><span class="spinner"></span>Searching for devices</h3><p>Devices on the network show up in the list on the left.</p>`;
+  } else if (s.phase === 'error' && s.lastJob === 'calibrate') {
+    html = `<h3>Calibration failed</h3><p style="color:var(--err)">${s.message}</p><ol><li>All cameras must see <b>the same part of the scene</b> (overlap of 25 % or more).</li><li>The scene must be <b>textured and lit</b>, not a blank wall.</li><li>Keep the devices still.</li></ol>`;
+  } else {
+    html = `<h3>Get started</h3><ol><li>Tick two or more devices.</li><li>Point them at the same static, textured scene and keep them still.</li><li>Press <b>Calibrate</b>.</li><li>Then <b>Point cloud</b> (stereo devices) or <b>Panorama</b>.</li></ol><p style="margin-top:10px;font-size:13px">Devices with a stereo pair use it for the metric scale; otherwise you are asked for a measured camera distance.</p>` + (s.phase === 'error' ? `<p style="margin-top:10px;color:var(--err)">${s.message}</p>` : '');
+  }
+  if ($('guideCard').innerHTML !== html) $('guideCard').innerHTML = html;
+}
+
+// ------------------------------------------------------------------ PTP password modal
+let modalDevices = '';
+let modalNeed = [];
+function renderPtp(s) {
+  const ptp = s.ptp || {};
+  const warn = $('ptpWarning');
+  warn.hidden = !ptp.warning || !(s.busy || s.lastJob === 'calibrate');
+  warn.textContent = ptp.warning || '';
+  const info = $('ptpInfo');
+  const parts = [];
+  if (ptp.active && s.phase === 'calibrating') parts.push(`PTP active, master ${ptp.master}`, ptp.settled === true ? 'frames locked' : ptp.groups ? 'waiting for the frames to lock' : 'no synchronized group yet');
+  renderSpread(s);
+  info.hidden = !parts.length;
+  info.textContent = parts.join(' · ');
+
+  const need = (s.phase === 'ptp_password') ? (ptp.needPassword || []) : [];
+  const modal = $('pwModal');
+  const key = need.join('|');
+  if (need.length && key !== modalDevices) {
+    modalDevices = key;
+    modalNeed = need;
+    $('pwSame').parentElement.hidden = need.length < 2;
+    renderPasswordRows();
+    modal.hidden = false;
+  }
+  if (!need.length) { modal.hidden = true; modalDevices = ''; }
+}
+
+function renderPasswordRows() {
+  const same = $('pwSame').checked && modalNeed.length > 1;
+  const rows = same ? [{ label: `${modalNeed.length} devices`, ips: modalNeed, title: modalNeed.join(', ') }] : modalNeed.map(ip => ({ label: ip, ips: [ip], title: ip }));
+  $('pwRows').innerHTML = '';
+  for (const r of rows) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const label = document.createElement('label'); label.textContent = r.label; label.title = r.title;
+    const input = document.createElement('input'); input.type = 'password'; input.dataset.ips = r.ips.join(','); input.placeholder = 'root password'; input.autocomplete = 'off';
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') submitPasswords(); });
+    row.append(label, input);
+    $('pwRows').appendChild(row);
+  }
+  const first = $('pwRows').querySelector('input'); if (first) first.focus();
+}
+
+function submitPasswords() {
+  const inputs = [...$('pwRows').querySelectorAll('input')];
+  if (!inputs.length) return;
+  const passwords = {};
+  inputs.forEach(inp => { for (const ip of inp.dataset.ips.split(',')) passwords[ip] = inp.value; });
+  if (Object.values(passwords).some(v => !v)) { alert('Enter a password for every device or continue without PTP.'); return; }
+  inputs.forEach(inp => inp.value = '');
+  post('/api/ptp/passwords', { passwords });
+}
+
+$('pwSame').onchange = renderPasswordRows;
+$('pwSubmit').onclick = submitPasswords;
+$('pwSkip').onclick = () => post('/api/ptp/skip');
+
+// ------------------------------------------------------------------ measured distances modal
+let distKey = '';
+function renderDistanceModal(s) {
+  const req = s.phase === 'distance_input' ? s.distanceRequest : null;
+  const modal = $('distModal');
+  if (!req) { modal.hidden = true; distKey = ''; return; }
+  const key = JSON.stringify(req.pairs.map(p => [p.from, p.fromSocket, p.to, p.toSocket]));
+  if (key === distKey) return;
+  distKey = key;
+  $('distIntro').textContent = (req.required
+    ? 'No stereo pair fixes the scale: enter the measured distance between the lens centers of at least one camera pair, in cm.'
+    : 'Measured lens-center distances, in cm, as extra scale constraints.') + ' Leave unknown pairs empty.';
+  $('distRows').innerHTML = '';
+  for (const p of req.pairs) {
+    const row = document.createElement('div');
+    row.className = 'row dist';
+    const label = document.createElement('label'); label.textContent = `${p.from} / ${p.fromSocket}  ↔  ${p.to} / ${p.toSocket}`;
+    const input = document.createElement('input'); input.type = 'number'; input.min = '1'; input.step = '0.1'; input.placeholder = 'cm';
+    if (p.cm != null) input.value = p.cm;
+    Object.assign(input.dataset, { from: p.from, fromSocket: p.fromSocket, to: p.to, toSocket: p.toSocket });
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') submitDistances(); });
+    row.append(label, input);
+    $('distRows').appendChild(row);
+  }
+  $('distSkip').hidden = req.required;
+  modal.hidden = false;
+  const first = $('distRows').querySelector('input'); if (first) first.focus();
+}
+
+function submitDistances() {
+  const distances = [];
+  for (const inp of $('distRows').querySelectorAll('input')) {
+    if (inp.value === '') continue;
+    const cm = Number(inp.value);
+    if (!(cm > 0)) { alert('Distances must be positive numbers in centimeters.'); return; }
+    distances.push({ from: inp.dataset.from, fromSocket: inp.dataset.fromSocket, to: inp.dataset.to, toSocket: inp.dataset.toSocket, cm });
+  }
+  if (!distances.length && (state.distanceRequest || {}).required) { alert('Enter at least one measured distance.'); return; }
+  post('/api/distances', { distances });
+}
+$('distSubmit').onclick = submitDistances;
+$('distSkip').onclick = () => post('/api/distances', { distances: [] });
+
+// ------------------------------------------------------------------ 3D view of the coordinate systems
+const scene = (() => {
+  const canvas = $('scene');
+  const ctx = canvas.getContext('2d');
+  let calibration = null;
+  let items = [];  // drawable primitives in world coordinates
+  let center = [0, 0, 0], span = 1;
+  const view = { yaw: Math.PI - 0.6, pitch: -0.45, dist: 3, pan: [0, 0] };
+  let drag = null;
+
+  // The common origin frame is a camera frame (x right, y down, z forward). The view uses -y as "up" so a
+  // rig standing upright is drawn upright; yaw rotates around that axis, pitch tilts the view. The viewer sits
+  // at +z of the rotated frame, so the screen x is the negated rotated x (otherwise the image is mirrored).
+  function rotate(p) {
+    const [x, y, z] = [p[0] - center[0], p[1] - center[1], p[2] - center[2]];
+    const cy = Math.cos(view.yaw), sy = Math.sin(view.yaw);
+    const x1 = cy * x + sy * z, z1 = -sy * x + cy * z;
+    const cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+    const y2 = cp * y - sp * z1, z2 = sp * y + cp * z1;
+    return [-x1, y2, z2];
+  }
+  function project(p) {
+    const [x, y, z] = rotate(p);
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    const f = 0.9 * Math.min(w, h);
+    const depth = view.dist * span - z;  // camera sits at +z looking at the center
+    if (depth < 0.05 * span) return null;
+    const k = f / depth;
+    return [w / 2 + view.pan[0] + x * k, h / 2 + view.pan[1] + y * k, depth, k];
+  }
+  function mul(m, p) { return [m[0][0] * p[0] + m[0][1] * p[1] + m[0][2] * p[2] + m[0][3], m[1][0] * p[0] + m[1][1] * p[1] + m[1][2] * p[2] + m[1][3], m[2][0] * p[0] + m[2][1] * p[1] + m[2][2] * p[2] + m[2][3]]; }
+
+  function build() {
+    items = [];
+    if (!calibration) return;
+    const positions = calibration.devices.map(d => [d.pose[0][3], d.pose[1][3], d.pose[2][3]]);
+    for (const d of calibration.devices) for (const c of d.cameras) positions.push([c.pose[0][3], c.pose[1][3], c.pose[2][3]]);
+    const mins = [0, 1, 2].map(i => Math.min(...positions.map(p => p[i]))), maxs = [0, 1, 2].map(i => Math.max(...positions.map(p => p[i])));
+    center = [0, 1, 2].map(i => (mins[i] + maxs[i]) / 2);
+    span = Math.max(0.3, ...[0, 1, 2].map(i => maxs[i] - mins[i]));
+    const axisLen = Math.max(0.06, 0.18 * span);
+    const camSize = Math.max(0.03, 0.08 * span);
+    const byId = {};
+    for (const d of calibration.devices) {
+      byId[d.deviceId] = d;
+      const o = mul(d.pose, [0, 0, 0]);
+      const axes = [['#d62728', [axisLen, 0, 0]], ['#2ca02c', [0, axisLen, 0]], ['#1f77b4', [0, 0, axisLen]]];
+      for (const [color, v] of axes) items.push({ type: 'line', a: o, b: mul(d.pose, v), color, width: d.isOrigin ? 3 : 2, arrow: true });
+      items.push({ type: 'point', p: o, color: d.isOrigin ? '#5b3cf5' : '#1d232b', r: d.isOrigin ? 5 : 4 });
+      items.push({ type: 'label', p: o, text: d.name, sub: d.isOrigin ? 'origin' : null, bold: d.isOrigin });
+      for (const c of d.cameras) {
+        // Camera frustum: apex at the lens, base plane camSize ahead along +z, 16:10 aspect
+        const apex = mul(c.pose, [0, 0, 0]);
+        const w = camSize * 0.8, h = camSize * 0.5, zf = camSize;
+        const corners = [[-w, -h, zf], [w, -h, zf], [w, h, zf], [-w, h, zf]].map(v => mul(c.pose, v));
+        for (let i = 0; i < 4; i++) {
+          items.push({ type: 'line', a: apex, b: corners[i], color: '#555', width: 1 });
+          items.push({ type: 'line', a: corners[i], b: corners[(i + 1) % 4], color: '#555', width: 1 });
+        }
+        items.push({ type: 'line', a: corners[3], b: corners[0], color: '#d62728', width: 2 });  // top edge of the image marked red
+        items.push({ type: 'fill', pts: corners, color: 'rgba(85,85,85,.12)' });
+      }
+    }
+    {
+      for (const e of calibration.edges) {
+        const a = byId[e.from], b = byId[e.to];
+        if (!a || !b) continue;
+        const pa = mul(a.pose, [0, 0, 0]), pb = mul(b.pose, [0, 0, 0]);
+        items.push({ type: 'line', a: pa, b: pb, color: '#999', width: 1, dash: [6, 5] });
+        const dist = Math.hypot(pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]);
+        items.push({ type: 'label', p: [(pa[0] + pb[0]) / 2, (pa[1] + pb[1]) / 2, (pa[2] + pb[2]) / 2], text: `${(100 * dist).toFixed(1)} cm`, small: true, muted: true });
+      }
+    }
+    // Ground-ish reference grid in the origin's x-z plane (the plane of the origin camera's optical axis)
+    const step = [0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 5].find(v => v >= span / 5) || 10;
+    const g = Math.ceil(span * 1.2 / step) * step;
+    for (let v = -g; v <= g + 1e-9; v += step) {
+      items.push({ type: 'line', a: [center[0] + v, 0, center[2] - g], b: [center[0] + v, 0, center[2] + g], color: '#eceef2', width: 1, back: true });
+      items.push({ type: 'line', a: [center[0] - g, 0, center[2] + v], b: [center[0] + g, 0, center[2] + v], color: '#eceef2', width: 1, back: true });
+    }
+    items.push({ type: 'label', p: [center[0] + g, 0, center[2] - g], text: `${step >= 1 ? step + ' m' : (100 * step).toFixed(0) + ' cm'} grid`, small: true, muted: true });
+  }
+
+  function draw() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) { canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr); }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    if (!calibration) return;
+    const drawables = [];
+    for (const it of items) {
+      if (it.type === 'line') {
+        const a = project(it.a), b = project(it.b);
+        if (!a || !b) continue;
+        drawables.push({ it, a, b, depth: it.back ? 1e9 : (a[2] + b[2]) / 2 });
+      } else if (it.type === 'fill') {
+        const pts = it.pts.map(project);
+        if (pts.some(p => !p)) continue;
+        drawables.push({ it, pts, depth: pts.reduce((s, p) => s + p[2], 0) / pts.length + 1e-3 });
+      } else {
+        const p = project(it.p);
+        if (!p) continue;
+        drawables.push({ it, p, depth: it.type === 'label' ? -1e9 : p[2] - 1e-3 });
+      }
+    }
+    drawables.sort((x, y) => y.depth - x.depth);  // far first
+    for (const d of drawables) {
+      const it = d.it;
+      if (it.type === 'line') {
+        ctx.beginPath(); ctx.moveTo(d.a[0], d.a[1]); ctx.lineTo(d.b[0], d.b[1]);
+        ctx.strokeStyle = it.color; ctx.lineWidth = it.width; ctx.setLineDash(it.dash || []); ctx.stroke(); ctx.setLineDash([]);
+        if (it.arrow) {
+          const ang = Math.atan2(d.b[1] - d.a[1], d.b[0] - d.a[0]);
+          ctx.beginPath(); ctx.moveTo(d.b[0], d.b[1]);
+          ctx.lineTo(d.b[0] - 8 * Math.cos(ang - 0.4), d.b[1] - 8 * Math.sin(ang - 0.4));
+          ctx.lineTo(d.b[0] - 8 * Math.cos(ang + 0.4), d.b[1] - 8 * Math.sin(ang + 0.4));
+          ctx.closePath(); ctx.fillStyle = it.color; ctx.fill();
+        }
+      } else if (it.type === 'fill') {
+        ctx.beginPath(); ctx.moveTo(d.pts[0][0], d.pts[0][1]); for (const p of d.pts.slice(1)) ctx.lineTo(p[0], p[1]); ctx.closePath();
+        ctx.fillStyle = it.color; ctx.fill();
+      } else if (it.type === 'point') {
+        ctx.beginPath(); ctx.arc(d.p[0], d.p[1], it.r, 0, 2 * Math.PI); ctx.fillStyle = it.color; ctx.fill();
+      } else if (it.type === 'label') {
+        ctx.font = (it.bold ? '600 ' : '') + (it.small ? '11px' : '13px') + ' system-ui, sans-serif';
+        ctx.textBaseline = 'middle';
+        const x = d.p[0] + (it.small ? 4 : 9), y = d.p[1] - (it.small ? 0 : 8);
+        const text = it.text;
+        const tw = ctx.measureText(text).width;
+        ctx.fillStyle = 'rgba(255,255,255,.85)';
+        ctx.fillRect(x - 2, y - 8, tw + 4, it.sub ? 30 : 16);
+        ctx.fillStyle = it.muted ? '#6b7480' : '#1d232b';
+        ctx.fillText(text, x, y);
+        if (it.sub) { ctx.font = '11px system-ui, sans-serif'; ctx.fillStyle = '#6b7480'; ctx.fillText(it.sub, x, y + 14); }
+      }
+    }
+    // Small orientation gizmo of the origin frame, bottom right
+    const gx = w - 46, gy = h - 46;
+    for (const [color, v, name] of [['#d62728', [1, 0, 0], 'x'], ['#2ca02c', [0, 1, 0], 'y'], ['#1f77b4', [0, 0, 1], 'z']]) {
+      const r = rotate([center[0] + v[0], center[1] + v[1], center[2] + v[2]]);
+      ctx.beginPath(); ctx.moveTo(gx, gy); ctx.lineTo(gx + r[0] * 26, gy + r[1] * 26); ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+      ctx.font = '11px system-ui, sans-serif'; ctx.fillStyle = color; ctx.fillText(name, gx + r[0] * 34 - 3, gy + r[1] * 34);
+    }
+  }
+
+  function setView(name) {
+    view.pan = [0, 0]; view.dist = 3;
+    if (name === 'top') { view.yaw = Math.PI; view.pitch = -Math.PI / 2 + 0.001; }  // from above, z up on the screen
+    else if (name === 'front') { view.yaw = 0; view.pitch = 0; }  // facing the origin camera
+    else if (name === 'side') { view.yaw = Math.PI / 2; view.pitch = 0; }
+    else { view.yaw = Math.PI - 0.6; view.pitch = -0.45; }  // from behind and above the origin camera
+    draw();
+  }
+
+  canvas.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey }; canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    drag.x = e.clientX; drag.y = e.clientY;
+    if (drag.pan) { view.pan[0] += dx; view.pan[1] += dy; }
+    else { view.yaw -= dx * 0.008; view.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, view.pitch - dy * 0.008)); }  // the near side follows the mouse
+    draw();
+  });
+  canvas.addEventListener('pointerup', () => { drag = null; });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  canvas.addEventListener('wheel', e => { e.preventDefault(); view.dist = Math.max(0.8, Math.min(20, view.dist * Math.exp(e.deltaY * 0.0012))); draw(); }, { passive: false });
+  for (const b of $('viewtools').querySelectorAll('button')) b.onclick = () => setView(b.dataset.view);
+  new ResizeObserver(draw).observe(canvas);
+
+  return {
+    setCalibration(c) {
+      if ((c && c.path) === (calibration && calibration.path)) return;
+      calibration = c;
+      build();
+      draw();
+    },
+    redraw: draw,
+  };
+})();
+
+// ------------------------------------------------------------------ wiring
+async function poll() {
+  try { render(await (await fetch('/api/state')).json()); } catch (e) { $('message').textContent = 'App not reachable: ' + e; }
+}
+
+for (const fold of document.querySelectorAll('details.fold')) {
+  try { fold.open = localStorage.getItem('fold:' + fold.dataset.key) === 'open'; } catch (e) { fold.open = false; }
+  fold.addEventListener('toggle', () => { try { localStorage.setItem('fold:' + fold.dataset.key, fold.open ? 'open' : 'closed'); } catch (e) {} });
+}
+$('refresh').onclick = () => post('/api/refresh');
+$('inspect').onclick = () => post('/api/inspect', { devices: selectedDevices() });
+$('calibrate').onclick = () => {
+  const devices = selectedDevices();
+  const chosen = {}; for (const d of devices) if (modes[d]) chosen[d] = modes[d];
+  shownFollowsLatest = true;
+  post('/api/calibrate', { devices, modes: chosen, askDistances: $('askDistances').checked });
+};
+$('pointcloud').onclick = () => post('/api/pointcloud', { devices: selectedDevices() });
+$('panorama').onclick = () => post('/api/panorama', { devices: selectedDevices(), projection: $('projection').value });
+$('stop').onclick = () => post('/api/stop');
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>
