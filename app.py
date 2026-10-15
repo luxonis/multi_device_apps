@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Multi-device app: pick OAK 4 devices on the network, calibrate them against each other
-(dai.beta.node.MultiDeviceCalibration), then run a merged point cloud or a calibrated panorama on them.
+(dai.beta.node.MultiDeviceCalibration), then run a merged point cloud, calibrated panorama or detections.
 
 A single Python process serves a small control page (device list, Check devices, Calibrate, Stop).
 "Check devices" connects to every selected device and reads which cameras it has and whether its
@@ -17,7 +17,9 @@ turns it into a point cloud in the calibration origin (one host PointCloud node 
 extrinsics rebased by pipeline.setMultiDeviceCalibration place the points in the common frame) and
 sends the concatenated cloud to the DepthAI visualizer. "Panorama" feeds one undistorted camera per
 device into dai.beta.node.Stitching composed from the calibration (cylindrical, spherical or
-perspective surface) and streams the result to the page as MJPEG.
+perspective surface) and streams the result to the page as MJPEG. "Detections" runs inference on each
+camera and uses ImgDetectionsFilter to remap and merge detections onto that panorama, with an overlay
+in the visualizer and live filter controls on the page.
 
     /usr/bin/python3 app.py            # then open http://localhost:8093
 """
@@ -47,13 +49,16 @@ import cv2  # noqa: E402
 import depthai as dai  # noqa: E402
 import numpy as np  # noqa: E402
 
-APP_VERSION = "0.1"
+APP_VERSION = "0.2"
 APP_DIR = Path(__file__).resolve().parent
 CALIBRATION_DIR = APP_DIR / "calibrations"
 VISUALIZER_DIR = APP_DIR / "visualizer"  # DepthAI visualizer static files served by this app (if present)
 VISUALIZER_MIME = {".html": "text/html", ".css": "text/css", ".js": "application/javascript", ".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon", ".json": "application/json", ".txt": "text/plain", ".map": "application/json", ".woff": "font/woff", ".woff2": "font/woff2", ".wasm": "application/wasm"}
 POINT_CLOUD_TOPIC = "merged_point_cloud"
 PROJECTIONS = {"cylindrical": dai.CameraModel.Cylindrical, "spherical": dai.CameraModel.Equirectangular, "perspective": dai.CameraModel.Perspective}
+STITCHING_NODE = getattr(dai.node, "Stitching", None) or dai.beta.node.Stitching
+DETECTIONS_AVAILABLE = hasattr(dai.node, "ImgDetectionsFilter") and hasattr(dai, "ImgDetectionsFilterConfig") and hasattr(STITCHING_NODE, "outSourceMasks")
+DETECTION_DEFAULTS = {"confidence": 0.5, "labels": None, "rejectLabels": None, "minArea": 0.0, "maxDetections": None, "overlap": "nms", "iou": 0.4}
 CAMERA_FPS = 10.0  # the PTP frame lock holds within ~0.01 ms at 10 FPS but wanders by 5-20 ms at 5 FPS
 PTP_CONF = "/etc/luxonis-ptp.conf"
 PTP_WARNING = "Devices are not PTP-synchronized: the calibration may be less precise."
@@ -74,6 +79,7 @@ def parse_args():
     parser.add_argument("--size", type=int, nargs=2, default=None, metavar=("W", "H"), help="Color / aligned depth size per device (default: the NeuralDepth model size; lower it for many devices on one link)")
     parser.add_argument("--pano-fps", type=float, default=10.0, help="Camera FPS for the panorama (default: 10)")
     parser.add_argument("--pano-size", type=int, nargs=2, default=(640, 400), metavar=("W", "H"), help="Camera output size fed to the stitcher (default: 640 400)")
+    parser.add_argument("--detections-model", default="luxonis/yolov6-nano:r2-coco-512x288", help="Model Zoo detection model, shared by all cameras (default: luxonis/yolov6-nano:r2-coco-512x288)")
     parser.add_argument("--seam", default="GRAPHCUT_COLOR", choices=["NONE", "VORONOI", "DP_COLOR", "DP_COLOR_GRAD", "GRAPHCUT_COLOR", "GRAPHCUT_COLOR_GRAD"], help="Panorama seam finder; NONE copies the inputs without blending (default: GRAPHCUT_COLOR)")
     parser.add_argument("--sample-count", type=int, default=10, help="Synchronized image groups collected per calibration (default: 10)")
     parser.add_argument("--fps", type=float, default=CAMERA_FPS, help="Camera FPS while calibrating (default: 10)")
@@ -84,6 +90,38 @@ def parse_args():
     parser.add_argument("--ptp-settle-ms", type=float, default=2.0, help="PTP counts as settled once 5 consecutive image groups of all devices lie within this many ms (default: 2)")
     parser.add_argument("--ptp-settle-timeout", type=float, default=20.0, help="Give up waiting for PTP to settle after this many seconds and calibrate anyway; the scene is static, so a few ms of spread do not matter (default: 20)")
     return parser.parse_args()
+
+
+def detection_config(settings, config=None):
+    """Validate browser settings and create a complete config; runtime messages replace every option."""
+    if not isinstance(settings, dict):
+        raise ValueError("Detection filters must be an object")
+    settings = {**DETECTION_DEFAULTS, **settings}
+    for key, low, high in (("confidence", 0.1, 0.95), ("iou", 0.0, 1.0), ("minArea", 0.0, float(np.finfo(np.float32).max))):
+        value = settings[key]
+        if type(value) not in (int, float) or not low <= value <= high:
+            raise ValueError(f"{key} must be between {low:g} and {high:g}")
+    for key in ("labels", "rejectLabels", "maxDetections"):
+        value = settings[key]
+        if value is None:
+            continue
+        values = [value] if key == "maxDetections" else value
+        if not isinstance(values, list) or any(type(v) is not int or not 0 <= v <= 0xFFFFFFFF for v in values):
+            raise ValueError(f"{key} requires nonnegative integer IDs or counts")
+    if settings["overlap"] not in ("off", "nms", "average"):
+        raise ValueError("Overlap must be off, nms or average")
+    config = config if config is not None else dai.ImgDetectionsFilterConfig()
+    config.setConfidenceRange(settings["confidence"])
+    config.labelsToKeep = settings["labels"]
+    config.labelsToReject = settings["rejectLabels"]
+    config.setSizeRange(settings["minArea"])
+    config.maxDetections = settings["maxDetections"]
+    config.sortByConfidence = True
+    config.overlapMode = getattr(dai.ImgDetectionsFilterConfig.OverlapMode, settings["overlap"].upper())
+    config.overlapIouThreshold = settings["iou"]
+    if not config.validate():
+        raise ValueError("Each filter minimum must be below its maximum")
+    return settings, config
 
 
 # ---------------------------------------------------------------- small geometry helpers
@@ -147,8 +185,8 @@ def local_origin_socket(calib, socket):
 # ---------------------------------------------------------------- ssh / PTP (same approach as the point cloud app)
 class DeviceSsh:
     """Runs commands on OAK devices as root over ssh. Uses paramiko when it is installed (works on Windows too);
-    otherwise the OpenSSH client, with the password handed over through SSH_ASKPASS. Without a password only
-    key / agent authentication is tried."""
+    otherwise the OpenSSH client, with the password handed over through SSH_ASKPASS. None tries key / agent
+    authentication; an empty string explicitly selects passwordless login."""
 
     def __init__(self):
         try:
@@ -196,15 +234,23 @@ class DeviceSsh:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            client.connect(ip, username="root", password=password, timeout=5, banner_timeout=10, auth_timeout=10,
-                           allow_agent=password is None, look_for_keys=password is None)
+            try:
+                client.connect(ip, username="root", password=password, timeout=5, banner_timeout=10, auth_timeout=10,
+                               allow_agent=password is None, look_for_keys=password is None)
+            except paramiko.AuthenticationException:
+                if password != "":
+                    raise
+                client.get_transport().auth_none("root")
         except paramiko.AuthenticationException:
+            client.close()
             return "needs_password", "authentication failed"
         except paramiko.SSHException as e:
+            client.close()
             if password is None or "auth" in str(e).lower():
                 return "needs_password", str(e)
             return "unreachable", str(e) or "ssh connection failed"
         except OSError as e:
+            client.close()
             return "unreachable", str(e) or "ssh connection failed"
         try:
             _, stdout, stderr = client.exec_command(command, timeout=timeout)
@@ -240,14 +286,16 @@ class App:
     def __init__(self, args):
         self.args = args
         self.lock = threading.Lock()
-        self.phase = "idle"  # idle | discovering | inspecting | calibrating | distance_input | ptp_password | pointcloud | panorama | error
+        self.phase = "idle"  # idle | discovering | inspecting | calibrating | distance_input | ptp_password | pointcloud | panorama | detections | error
         self.message = "Select devices."
-        self.stats = None  # live numbers of the running point cloud / panorama
-        self.live = None  # {"mode": "pointcloud"|"panorama", ...} while one of them runs
+        self.stats = None  # live numbers of the running mode
+        self.live = None  # {"mode": "pointcloud"|"panorama"|"detections", ...} while running
         self.streaming = False  # the viewer has content (clouds are being sent / panoramas arrive)
         self.pano_jpeg = None
         self.pano_seq = 0
         self.pano_cond = threading.Condition()
+        self.pending_detection_config = None
+        self.detection_topics = []
         self.progress = None
         self.devices = []  # discovered devices (dicts)
         self.device_info = {}  # device name -> inspection dict (cameras, stereo pair, local origin)
@@ -325,6 +373,7 @@ class App:
                 "live": self.live,
                 "streaming": self.streaming,
                 "visualizerPort": self.args.http_port,
+                "detectionsAvailable": DETECTIONS_AVAILABLE,
             }
 
     def preview_jpeg(self, name):
@@ -483,7 +532,7 @@ class App:
         return {"path": prev["path"], "time": prev["time"], "maxTranslation_cm": round(100 * worst_t, 2), "maxRotation_deg": round(worst_r, 3), "devices": per_device}
 
     # ---------------------------------------------------------------- jobs
-    def _start_job(self, target, *job_args):
+    def _start_job(self, target, *job_args, name=None):
         with self.lock:
             if self.job is not None and self.job.is_alive():
                 return False
@@ -493,10 +542,11 @@ class App:
             self.ptp_skip_requested = False
             self.distance_request = None
             self.job_devices = list(job_args[0]) if job_args and isinstance(job_args[0], list) else []
-            self.last_job = {self._inspect_job: "inspect", self._calibrate: "calibrate", self._pointcloud: "pointcloud", self._panorama: "panorama"}.get(target)
+            self.last_job = name or {self._inspect_job: "inspect", self._calibrate: "calibrate", self._pointcloud: "pointcloud", self._panorama: "panorama"}.get(target)
             self.streaming = False
             self.live = None
             self.stats = None
+            self.pending_detection_config = None
             self.job = threading.Thread(target=self._run_job, args=(target, *job_args), daemon=True)
             self.job.start()
             return True
@@ -509,11 +559,15 @@ class App:
             self.log(f"ERROR: {e}")
             self.set_state("error", "Calibration failed." if target == self._calibrate else f"Failed: {e}", progress=None, stats=None)
         finally:
+            for topic in self.detection_topics:
+                self.remote.removeTopic(topic)
+            self.detection_topics.clear()
             with self.lock:
                 self.passwords.clear()
                 self.distance_request = None
                 self.streaming = False
                 self.live = None
+                self.pending_detection_config = None
 
     def discover_async(self):
         return self._start_job(self._discover)
@@ -544,7 +598,7 @@ class App:
 
     def submit_passwords(self, passwords):
         with self.lock:
-            self.passwords.update({ip: pw for ip, pw in passwords.items() if pw})
+            self.passwords.update(passwords)
         self.credentials_event.set()
 
     def skip_ptp(self):
@@ -1120,90 +1174,167 @@ class App:
         return merged
 
     # ---------------------------------------------------------------- panorama
-    def panorama_async(self, device_names, projection):
-        return self._start_job(self._panorama, device_names, projection)
+    def panorama_async(self, device_names, projection, filters=None):
+        if filters is not None:
+            if not DETECTIONS_AVAILABLE:
+                raise ValueError("Detections requires an updated DepthAI wheel with ImgDetectionsFilter and Stitching source masks. See USAGE.md.")
+            filters, _ = detection_config(filters)
+        return self._start_job(self._panorama, device_names, projection, filters, name="detections" if filters is not None else "panorama")
 
-    def _panorama(self, device_names, projection):
-        args = self.args
-        projection = projection if projection in PROJECTIONS else "cylindrical"
-        self.set_state("panorama", "Checking the devices...", progress=None, stats=None)
-        self.log(f"Panorama of {device_names} started ({projection}, {args.pano_size[0]}x{args.pano_size[1]} at {args.pano_fps:g} FPS)")
-        device_ids, calibration = self._require_calibration(device_names)
+    def update_detection_filters(self, filters):
         with self.lock:
-            self.live = {"mode": "panorama", "projection": projection, "calibration": calibration["path"]}
+            if not self.live or self.live["mode"] != "detections":
+                raise ValueError("Start Detections before applying filters")
+            _, config = detection_config(filters)
+            self.pending_detection_config = config
+
+    def _panorama(self, device_names, projection, filters=None):
+        args = self.args
+        detections = filters is not None
+        mode = "detections" if detections else "panorama"
+        title = "Detections" if detections else "Panorama"
+        projection = projection if projection in PROJECTIONS else "cylindrical"
+        self.set_state(mode, "Checking the devices...", progress=None, stats=None)
+        self.log(f"{title} of {device_names} started ({projection}, {args.pano_size[0]}x{args.pano_size[1]} at {args.pano_fps:g} FPS)")
+        _, calibration = self._require_calibration(device_names)
+        with self.lock:
+            self.live = {"mode": mode, "projection": projection, "calibration": calibration["path"]}
             self.pano_jpeg = None
         ptp = self._prepare_ptp(device_names)
         if self.stop_event.is_set():
-            self.set_state("idle", "Panorama stopped.", stats=None)
+            self.set_state("idle", f"{title} stopped.", stats=None)
             return
-        self.set_state("panorama", "Connecting to devices...")
+        self.set_state(mode, "Connecting to devices (the first detection run may download the model)..." if detections else "Connecting to devices...")
         handler = dai.beta.MultiDeviceCalibrationHandler(Path(calibration["path"]))
         self.log(f"Using calibration {Path(calibration['path']).name}")
         with dai.Pipeline(createImplicitDevice=False) as pipeline:
             pipeline.setAutoCalibrationMode(dai.Pipeline.AutoCalibrationMode.OFF)
             devices = [pipeline.addDevice(dai.DeviceInfo(name)) for name in device_names]
             pipeline.setMultiDeviceCalibration(handler.getGraph())
+            topics = []
+            if detections:
+                detection_sync = self._monitor_sync(pipeline, args.pano_fps, ptp)
+                demux = pipeline.create(dai.node.MessageDemux)
+                demux.setRunOnHost(True)
+                detection_sync.out.link(demux.input)
+                filtered = pipeline.create(dai.node.ImgDetectionsFilter)
+                filtered.setRunOnHost(True)
+                detection_config(filters, filtered.initialConfig)
+                config_queues = [filtered.inputConfig.createInputQueue(maxSize=1, blocking=False)]
+                detection_queue = filtered.out.createOutputQueue(maxSize=2, blocking=False)
+                spread_queue = detection_sync.out.createOutputQueue(maxSize=2, blocking=False)
             outputs = []
-            for name, device in zip(device_names, devices):
+            for index, (name, device) in enumerate(zip(device_names, devices)):
                 info = self.device_info[name]
                 socket = self._panorama_socket(info, calibration)
                 camera = pipeline.create(dai.node.Camera, device).build(socket, sensorFps=args.pano_fps)
                 if ptp:
                     camera.initialControl.setFrameSyncMode(dai.CameraControl.FrameSyncMode.TIME_PTP)
                 outputs.append(camera.requestOutput(tuple(args.pano_size), dai.ImgFrame.Type.NV12, fps=args.pano_fps, enableUndistortion=True))
+                if detections:
+                    model = dai.NNModelDescription(args.detections_model, platform=device.getPlatformAsString())
+                    network = pipeline.create(dai.node.DetectionNetwork, device).build(camera, model, fps=args.pano_fps, resizeMode=dai.ImgResizeMode.LETTERBOX)
+                    network.setConfidenceThreshold(0.1)
+                    key = f"cam{index}"
+                    network.out.link(detection_sync.inputs[key])
+                    # Demux outputs default to Buffer; filters require a concrete ImgDetections type.
+                    demux.outputs[key].setPossibleDatatypes([(dai.DatatypeEnum.ImgDetections, False)])
+                    demux.outputs[key].link(filtered.inputs[key])
+                    source_filter = pipeline.create(dai.node.ImgDetectionsFilter)
+                    source_filter.setRunOnHost(True)
+                    detection_config(filters, source_filter.initialConfig)
+                    network.out.link(source_filter.inputs[key])
+                    config_queues.append(source_filter.inputConfig.createInputQueue(maxSize=1, blocking=False))
+                    group = f"Camera {index + 1}: {name} / {socket.name}"
+                    topics.extend([(f"Source image {index + 1}", network.passthrough, group), (f"Source detections {index + 1}", source_filter.out, group)])
                 self.log(f"{name}: {socket.name} undistorted {args.pano_size[0]}x{args.pano_size[1]}")
-            stitching = pipeline.create(dai.beta.node.Stitching).build(outputs)
-            stitching.setMode(dai.beta.node.Stitching.Mode.PANORAMA)
+            stitching = pipeline.create(STITCHING_NODE).build(outputs)
+            stitching.setRunOnHost(True)
+            stitching.setMode(STITCHING_NODE.Mode.PANORAMA)
             stitching.setCameraModel(PROJECTIONS[projection])
             stitching.setUseInputCalibration(True)
-            stitching.setSeamFinder(getattr(dai.beta.node.Stitching.SeamFinder, args.seam))
-            stitching.setMaxPanoramaSize(8192, 4096)
+            stitching.setSeamFinder(getattr(STITCHING_NODE.SeamFinder, args.seam))
+            stitching.setMaxPanoramaSize(2560 if detections else 8192, 1440 if detections else 4096)
             stitching.setSyncThreshold(timedelta(milliseconds=(900.0 if ptp else 1000.0) / args.pano_fps))
             stitching.sync.setTimestampSource(dai.node.Sync.TimestampSource.SYSTEM if ptp else dai.node.Sync.TimestampSource.HOST)
             stitching.sync.setSyncAttempts(-1)
+            if detections:
+                stitching.out.link(filtered.inputReference)
+                for index in range(len(outputs)):
+                    stitching.outSourceMasks[f"input{index}"].link(filtered.inputSourceMasks[f"cam{index}"])
+                topics.extend([
+                    ("Panorama", stitching.out, "Detections"),
+                    ("Filtered detections", filtered.out, "Detections"),
+                ])
+                for topic, output, group in topics:
+                    self.remote.addTopic(topic, output, group)
+                    self.detection_topics.append(topic)
+                self.log(f"Detection model: {args.detections_model}; source masks enabled, filters: {filters}")
             out_queue = stitching.out.createOutputQueue(maxSize=2, blocking=False)
             pipeline.start()
             start = time.monotonic()
             last_report = start
             count = 0
             window_count = 0
+            detection_counts = None
             self.set_state(message="Starting cameras...")
             try:
                 while pipeline.isRunning() and not self.stop_event.is_set():
+                    if detections:
+                        pipeline.processTasks()
+                        with self.lock:
+                            pending = self.pending_detection_config
+                            self.pending_detection_config = None
+                        if pending is not None:
+                            for queue in config_queues:
+                                queue.send(pending)
                     frame = out_queue.get(timedelta(milliseconds=200))
                     now = time.monotonic()
+                    if detections:
+                        for spread in spread_queue.tryGetAll():
+                            self.set_ptp(spreadMs=round(spread.getIntervalNs() / 1e6, 2), spreadAt=now)
+                        for result in detection_queue.tryGetAll():
+                            detection_counts = {"detections": len(result.detections)}
+                        if detection_counts is not None:
+                            with self.lock:
+                                self.streaming = True
+                            self.set_state(message="Streaming the panorama with merged detections.")
+                        elif count and now - start > 20:
+                            self.set_state(message="Panorama is streaming; waiting for synchronized detections from every camera.")
                     if frame is None:
                         if count == 0 and now - start > 20 and now - last_report > 5:
-                            self.set_state(message="No panorama yet. Do the cameras stream?")
+                            self.set_state(message="Waiting for panorama and detections. Check that every camera streams." if detections else "No panorama yet. Do the cameras stream?")
                             last_report = now
                         continue
                     count += 1
                     window_count += 1
-                    ok, encoded = cv2.imencode(".jpg", frame.getCvFrame(), [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    if not ok:
-                        continue
-                    with self.pano_cond:
-                        self.pano_jpeg = encoded.tobytes()
-                        self.pano_seq += 1
-                        self.pano_cond.notify_all()
+                    if not detections:
+                        ok, encoded = cv2.imencode(".jpg", frame.getCvFrame(), [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        if not ok:
+                            continue
+                        with self.pano_cond:
+                            self.pano_jpeg = encoded.tobytes()
+                            self.pano_seq += 1
+                            self.pano_cond.notify_all()
                     if count == 1:
                         t = frame.getTransformation()
                         fx = t.getIntrinsicMatrix()[0][0]
                         span = math.degrees(frame.getWidth() / fx) if fx > 0 and projection != "perspective" else None
                         self.log(f"First panorama after {now - start:.1f} s: {frame.getWidth()}x{frame.getHeight()}" + (f", {span:.0f} deg" if span else ""))
-                        with self.lock:
-                            self.streaming = True
-                        self.set_state(message="Streaming the panorama.")
+                        if not detections:
+                            with self.lock:
+                                self.streaming = True
+                            self.set_state(message="Streaming the panorama.")
                     if now - last_report >= 2.0:
-                        self.set_state(stats={"rate": round(window_count / (now - last_report), 1), "frames": count, "width": frame.getWidth(), "height": frame.getHeight(), "projection": projection})
+                        self.set_state(stats={"rate": round(window_count / (now - last_report), 1), "frames": count, "width": frame.getWidth(), "height": frame.getHeight(), "projection": projection, **(detection_counts or {})})
                         last_report = now
                         window_count = 0
             finally:
                 pipeline.stop()
         with self.lock:
             self.streaming = False
-        self.log(f"Panorama stopped after {count} frames")
-        self.set_state("idle", "Panorama stopped.", stats=None)
+        self.log(f"{title} stopped after {count} frames")
+        self.set_state("idle", f"{title} stopped.", stats=None)
 
     def wait_panorama(self, seen_seq, timeout=1.0):
         """Blocks until a panorama newer than seen_seq exists; returns (jpeg, seq) or (None, seen_seq)."""
@@ -1334,10 +1465,24 @@ class Handler(BaseHTTPRequestHandler):
             if len(devices) < 2:
                 return self._json({"error": "Select at least two devices"}, 400)
             ok = self.app.pointcloud_async(devices)
-        elif self.path == "/api/panorama":
+        elif self.path in ("/api/panorama", "/api/detections"):
             if len(devices) < 2:
                 return self._json({"error": "Select at least two devices"}, 400)
-            ok = self.app.panorama_async(devices, body.get("projection") or "cylindrical")
+            try:
+                filters = body.get("filters", {}) if self.path == "/api/detections" else None
+                if self.path == "/api/detections" and not isinstance(filters, dict):
+                    raise ValueError("Detection filters must be an object")
+                if len(set(devices)) != len(devices):
+                    raise ValueError("Select distinct devices")
+                ok = self.app.panorama_async(devices, body.get("projection") or "cylindrical", filters)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+        elif self.path == "/api/detections/filters":
+            try:
+                self.app.update_detection_filters(body.get("filters", {}))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            ok = True
         elif self.path == "/api/distances":
             self.app.submit_distances(body.get("distances") or [])
             ok = True

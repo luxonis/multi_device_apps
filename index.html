@@ -13,7 +13,7 @@
   header h1 { font-size:16px; margin:0; }
   .dot { width:10px; height:10px; border-radius:50%; background:#aab; }
   .dot.calibrating, .dot.discovering, .dot.inspecting { background:var(--warn); animation:pulse 1s infinite; }
-  .dot.pointcloud, .dot.panorama { background:var(--ok); animation:pulse 1s infinite; }
+  .dot.pointcloud, .dot.panorama, .dot.detections { background:var(--ok); animation:pulse 1s infinite; }
   .dot.error { background:var(--err); }
   .dot.ptp_password, .dot.distance_input { background:var(--accent); animation:pulse 1s infinite; }
   .devices .ptp { font-size:11px; padding:1px 6px; border-radius:10px; background:#eef0ff; color:var(--accent); margin-left:6px; }
@@ -54,7 +54,7 @@
   .status-card { border-radius:8px; background:var(--bg); border-left:5px solid #aab; padding:12px 14px; display:flex; flex-direction:column; gap:8px; }
   .status-card.calibrating, .status-card.ptp_password, .status-card.distance_input, .status-card.inspecting { border-left-color:var(--warn); background:#fff7ea; }
   .status-card.discovering { border-left-color:var(--accent); background:#f1efff; }
-  .status-card.pointcloud, .status-card.panorama { border-left-color:var(--ok); background:#eef9f2; }
+  .status-card.pointcloud, .status-card.panorama, .status-card.detections { border-left-color:var(--ok); background:#eef9f2; }
   .status-card.error { border-left-color:var(--err); background:#fdecec; }
   .status-card .phase { display:flex; align-items:center; gap:8px; font-weight:600; font-size:14px; }
   .status-card.error .message { color:var(--err); }
@@ -105,6 +105,9 @@
   .viewer iframe { width:100%; height:100%; border:0; background:#fff; }
   .viewer .pano { width:100%; height:100%; object-fit:contain; background:#1d232b; display:block; }
   .option select { font:inherit; font-size:12.5px; padding:2px 4px; border:1px solid var(--line); border-radius:4px; background:var(--panel); color:var(--text); }
+  .filters { border:0; padding:0; margin:0; display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .filters label { display:flex; flex-direction:column; gap:3px; font-size:12px; color:var(--muted); }
+  .filters input, .filters select { width:100%; min-width:0; font:inherit; padding:5px; border:1px solid var(--line); border-radius:4px; }
   .viewer canvas:active { cursor:grabbing; }
   .viewtools { position:absolute; top:10px; right:12px; display:flex; gap:6px; align-items:center; background:rgba(255,255,255,.92); border:1px solid var(--line); border-radius:8px; padding:6px 8px; font-size:12px; }
   .viewtools label { display:flex; gap:4px; align-items:center; color:var(--muted); }
@@ -142,10 +145,28 @@
       <div class="actions" style="margin-top:8px">
         <button class="primary" id="pointcloud" title="Merged point cloud of the selected stereo devices (needs a calibration)">Point cloud</button>
         <button class="primary" id="panorama" title="Calibrated panorama of one camera per device (needs a calibration)">Panorama</button>
+        <button class="primary" id="detections" title="Merge detections from all selected cameras onto a calibrated panorama">Detections</button>
         <select id="projection" title="Panorama projection surface"><option value="cylindrical">Cylindrical</option><option value="spherical">Spherical</option><option value="perspective">Perspective</option></select>
       </div>
       <label class="option" title="Tape-measured distances between camera lens centers. Required when no device uses a stereo pair, optional otherwise."><input type="checkbox" id="askDistances"> Enter measured distances</label>
     </section>
+    <details class="fold" data-key="detections">
+      <summary><h2>Detection filters</h2></summary>
+      <form id="detectionForm">
+        <fieldset class="filters" id="detectionFields">
+          <label>Overlap<select id="overlap"><option value="off">Off</option><option value="nms" selected>NMS</option><option value="average">Average</option></select></label>
+          <label>Overlap IoU<input id="detectionIou" type="number" min="0" max="1" step="0.05" value="0.4" required></label>
+          <label>Confidence<input id="detectionConfidence" type="number" min="0.1" max="0.95" step="0.05" value="0.5" required></label>
+          <label>Minimum area (px² per view)<input id="detectionArea" type="number" min="0" step="1" value="0" required></label>
+          <label>Keep label IDs<input id="detectionLabels" placeholder="All; person = 0"></label>
+          <label>Reject label IDs<input id="detectionRejectLabels" placeholder="None"></label>
+          <label>Maximum detections per view<input id="detectionCount" type="number" min="0" max="4294967295" step="1" placeholder="Unlimited"></label>
+          <button class="small" id="applyFilters" type="submit" disabled>Apply filters</button>
+        </fieldset>
+      </form>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:0">Filters apply to the panorama and each source view. Label IDs are comma separated. Off keeps duplicates; NMS chooses one; Average merges them across cameras in the panorama.</p>
+      <p id="detectionsRequirement" style="font-size:12px;color:var(--warn)" hidden>Install the updated DepthAI wheel for Detections; see USAGE.md.</p>
+    </details>
     <section>
       <div class="status-card" id="statusCard">
         <div class="phase"><span class="dot" id="dot"></span><span id="phase">idle</span></div>
@@ -198,7 +219,7 @@
 <div class="modal-backdrop" id="pwModal" hidden>
   <div class="modal">
     <h3>Root password for PTP setup</h3>
-    <p>Needed to configure PTP time sync over ssh (OAK 4 default: <code>oelinux123</code>). Used for this run only, never stored.</p>
+    <p>Needed to configure PTP time sync over ssh (OAK 4 default: <code>oelinux123</code>). Leave blank for devices without a password. Used for this run only, never stored.</p>
     <div id="pwRows"></div>
     <label class="same"><input type="checkbox" id="pwSame"> Same password for all devices</label>
     <div class="actions">
@@ -386,6 +407,12 @@ function updateButtons() {
   $('pointcloud').title = n >= 2 && !covered ? 'Calibrate these devices first' : !stereo ? 'Every device needs a stereo pair' : 'Merged point cloud of the selected devices';
   $('panorama').disabled = busy || !covered;
   $('panorama').title = n >= 2 && !covered ? 'Calibrate these devices first' : 'Calibrated panorama of the selected devices';
+  $('detections').disabled = busy || !covered || !state.detectionsAvailable;
+  $('detections').title = !state.detectionsAvailable ? 'Install the updated DepthAI wheel; see USAGE.md' : !covered ? 'Calibrate these devices first' : 'Show merged detections on the panorama';
+  const detecting = busy && state.live && state.live.mode === 'detections';
+  $('detectionFields').disabled = !state.detectionsAvailable || (busy && !detecting);
+  $('applyFilters').disabled = !detecting;
+  $('detectionsRequirement').hidden = !!state.detectionsAvailable;
   $('projection').disabled = busy;
   $('stop').disabled = !busy || state.phase === 'discovering';
   $('refresh').disabled = busy;
@@ -433,7 +460,7 @@ function render(s) {
   state = s;
   if (s.version) $('version').textContent = 'v' + s.version;
   $('dot').className = 'dot ' + s.phase;
-  $('phase').textContent = { idle: 'Ready', discovering: 'Searching devices', inspecting: 'Checking devices', calibrating: 'Calibrating', ptp_password: 'Waiting for passwords', distance_input: 'Waiting for distances', pointcloud: 'Point cloud', panorama: 'Panorama', error: 'Error' }[s.phase] || s.phase;
+  $('phase').textContent = { idle: 'Ready', discovering: 'Searching devices', inspecting: 'Checking devices', calibrating: 'Calibrating', ptp_password: 'Waiting for passwords', distance_input: 'Waiting for distances', pointcloud: 'Point cloud', panorama: 'Panorama', detections: 'Detections', error: 'Error' }[s.phase] || s.phase;
   $('statusCard').className = 'status-card ' + s.phase;
   $('message').textContent = s.message;
   const p = $('progress');
@@ -478,23 +505,27 @@ function render(s) {
 
 let panoStreaming = false;
 function renderLive(s) {
-  const pc = s.phase === 'pointcloud', pano = s.phase === 'panorama';
+  const pc = s.phase === 'pointcloud', pano = s.phase === 'panorama', detections = s.phase === 'detections';
+  const remote = pc || detections;
   const viewer = $('viewer');
-  if (pc && !viewer.src) viewer.src = `${location.protocol}//${location.hostname}:${s.visualizerPort}/`;
-  viewer.hidden = !(pc && s.streaming);
+  // The visualizer fetches topic groups on load, after this mode has registered its topics.
+  if (remote && s.streaming && !viewer.getAttribute('src')) viewer.src = `${location.protocol}//${location.hostname}:${s.visualizerPort}/`;
+  if (!(remote && s.streaming)) viewer.removeAttribute('src');
+  viewer.hidden = !(remote && s.streaming);
   const img = $('pano');
   if (pano && s.streaming && !panoStreaming) { img.src = `/api/panorama.mjpeg?t=${Date.now()}`; panoStreaming = true; }
   if (!(pano && s.streaming) && panoStreaming) { img.removeAttribute('src'); panoStreaming = false; }
   img.hidden = !(pano && s.streaming);
-  $('scene').hidden = pc || pano;
+  $('scene').hidden = remote || pano;
   const box = $('liveSection');
-  box.hidden = !((pc || pano) && s.stats);
+  box.hidden = !((remote || pano) && s.stats);
   if (box.hidden) return;
   const st = s.stats;
   const stats = pc
     ? [[`${st.rate}`, 'clouds / s'], [st.points.toLocaleString(), 'points'], [st.origin, 'origin']]
+    : detections ? [[`${st.rate}`, 'panoramas / s'], [`${st.detections ?? '–'}`, 'detections'], [`${st.width}×${st.height}`, 'panorama']]
     : [[`${st.rate}`, 'frames / s'], [`${st.width}×${st.height}`, 'panorama'], [st.projection, 'projection']];
-  $('liveTitle').textContent = pc ? 'Point cloud' : 'Panorama';
+  $('liveTitle').textContent = pc ? 'Point cloud' : detections ? 'Detections' : 'Panorama';
   const html = stats.map(([v, k]) => `<div><b>${v}</b><span>${k}</span></div>`).join('');
   if ($('liveStats').innerHTML !== html) $('liveStats').innerHTML = html;
 }
@@ -502,7 +533,7 @@ function renderLive(s) {
 function renderSpread(s) {
   const ptp = s.ptp || {};
   const box = $('spread');
-  box.hidden = !['calibrating', 'pointcloud', 'panorama'].includes(s.phase) || ptp.spreadMs == null;
+  box.hidden = !['calibrating', 'pointcloud', 'panorama', 'detections'].includes(s.phase) || ptp.spreadMs == null;
   if (box.hidden) return;
   const v = $('spreadValue');
   v.textContent = `${ptp.spreadMs.toFixed(2)} ms`;
@@ -514,7 +545,7 @@ function renderSpread(s) {
 function renderGuide(s, shown) {
   const box = $('guide');
   const calibrating = s.phase === 'calibrating' && s.previews && s.previews.length;
-  const running = (s.phase === 'pointcloud' || s.phase === 'panorama');
+  const running = ['pointcloud', 'panorama', 'detections'].includes(s.phase);
   const show = !calibrating && !(running && s.streaming) && (!shown || s.busy || s.phase === 'error');
   box.hidden = !show;
   $('viewtools').hidden = show || calibrating || running;
@@ -525,8 +556,10 @@ function renderGuide(s, shown) {
     html = `<h3><span class="spinner"></span>Starting the point cloud</h3><p>${s.message}</p>`;
   } else if (s.phase === 'panorama') {
     html = `<h3><span class="spinner"></span>Starting the panorama</h3><p>${s.message}</p>`;
+  } else if (s.phase === 'detections') {
+    html = `<h3><span class="spinner"></span>Starting detections</h3><p>${s.message}</p>`;
   } else if (s.phase === 'calibrating' || s.phase === 'ptp_password' || s.phase === 'distance_input') {
-    html = `<h3><span class="spinner"></span>${s.lastJob === 'pointcloud' ? 'Starting the point cloud' : s.lastJob === 'panorama' ? 'Starting the panorama' : 'Calibrating'}</h3><p>${s.message}</p>`;
+    html = `<h3><span class="spinner"></span>${s.lastJob === 'pointcloud' ? 'Starting the point cloud' : s.lastJob === 'panorama' ? 'Starting the panorama' : s.lastJob === 'detections' ? 'Starting detections' : 'Calibrating'}</h3><p>${s.message}</p>`;
   } else if (s.phase === 'inspecting') {
     html = `<h3><span class="spinner"></span>Checking devices</h3><p>${s.message}</p>`;
   } else if (s.phase === 'discovering') {
@@ -534,7 +567,7 @@ function renderGuide(s, shown) {
   } else if (s.phase === 'error' && s.lastJob === 'calibrate') {
     html = `<h3>Calibration failed</h3><p style="color:var(--err)">${s.message}</p><ol><li>All cameras must see <b>the same part of the scene</b> (overlap of 25 % or more).</li><li>The scene must be <b>textured and lit</b>, not a blank wall.</li><li>Keep the devices still.</li></ol>`;
   } else {
-    html = `<h3>Get started</h3><ol><li>Tick two or more devices.</li><li>Point them at the same static, textured scene and keep them still.</li><li>Press <b>Calibrate</b>.</li><li>Then <b>Point cloud</b> (stereo devices) or <b>Panorama</b>.</li></ol><p style="margin-top:10px;font-size:13px">Devices with a stereo pair use it for the metric scale; otherwise you are asked for a measured camera distance.</p>` + (s.phase === 'error' ? `<p style="margin-top:10px;color:var(--err)">${s.message}</p>` : '');
+    html = `<h3>Get started</h3><ol><li>Tick two or more devices.</li><li>Point them at the same static, textured scene and keep them still.</li><li>Press <b>Calibrate</b>.</li><li>Then <b>Point cloud</b> (stereo devices), <b>Panorama</b> or <b>Detections</b>.</li></ol><p style="margin-top:10px;font-size:13px">Devices with a stereo pair use it for the metric scale; otherwise you are asked for a measured camera distance.</p>` + (s.phase === 'error' ? `<p style="margin-top:10px;color:var(--err)">${s.message}</p>` : '');
   }
   if ($('guideCard').innerHTML !== html) $('guideCard').innerHTML = html;
 }
@@ -575,7 +608,7 @@ function renderPasswordRows() {
     const row = document.createElement('div');
     row.className = 'row';
     const label = document.createElement('label'); label.textContent = r.label; label.title = r.title;
-    const input = document.createElement('input'); input.type = 'password'; input.dataset.ips = r.ips.join(','); input.placeholder = 'root password'; input.autocomplete = 'off';
+    const input = document.createElement('input'); input.type = 'password'; input.dataset.ips = r.ips.join(','); input.placeholder = 'blank if no password'; input.autocomplete = 'off';
     input.addEventListener('keydown', e => { if (e.key === 'Enter') submitPasswords(); });
     row.append(label, input);
     $('pwRows').appendChild(row);
@@ -588,7 +621,6 @@ function submitPasswords() {
   if (!inputs.length) return;
   const passwords = {};
   inputs.forEach(inp => { for (const ip of inp.dataset.ips.split(',')) passwords[ip] = inp.value; });
-  if (Object.values(passwords).some(v => !v)) { alert('Enter a password for every device or continue without PTP.'); return; }
   inputs.forEach(inp => inp.value = '');
   post('/api/ptp/passwords', { passwords });
 }
@@ -822,6 +854,24 @@ const scene = (() => {
 })();
 
 // ------------------------------------------------------------------ wiring
+function detectionFilters() {
+  if (!$('detectionForm').reportValidity()) return null;
+  const filters = {
+    confidence: Number($('detectionConfidence').value), iou: Number($('detectionIou').value),
+    overlap: $('overlap').value, minArea: Number($('detectionArea').value),
+    maxDetections: $('detectionCount').value === '' ? null : Number($('detectionCount').value),
+  };
+  for (const [key, id] of [['labels', 'detectionLabels'], ['rejectLabels', 'detectionRejectLabels']]) {
+    const value = $(id).value.trim();
+    filters[key] = value ? value.split(/[\s,]+/).map(Number) : null;
+    if (value && (!/^\d+(?:[\s,]+\d+)*$/.test(value) || filters[key].some(v => !Number.isInteger(v) || v > 4294967295))) {
+      alert('Label IDs must be nonnegative integers separated by commas.');
+      return null;
+    }
+  }
+  return filters;
+}
+
 async function poll() {
   try { render(await (await fetch('/api/state')).json()); } catch (e) { $('message').textContent = 'App not reachable: ' + e; }
 }
@@ -840,6 +890,15 @@ $('calibrate').onclick = () => {
 };
 $('pointcloud').onclick = () => post('/api/pointcloud', { devices: selectedDevices() });
 $('panorama').onclick = () => post('/api/panorama', { devices: selectedDevices(), projection: $('projection').value });
+$('detections').onclick = () => {
+  const filters = detectionFilters();
+  if (filters) post('/api/detections', { devices: selectedDevices(), projection: $('projection').value, filters });
+};
+$('detectionForm').onsubmit = event => {
+  event.preventDefault();
+  const filters = detectionFilters();
+  if (filters) post('/api/detections/filters', { filters });
+};
 $('stop').onclick = () => post('/api/stop');
 poll();
 setInterval(poll, 1000);

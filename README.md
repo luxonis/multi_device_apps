@@ -1,7 +1,7 @@
 # Multi-device app
 
-Calibrate several OAK 4 devices against each other, then show a merged point cloud or a calibrated
-panorama of all of them. Browser UI, one Python process, DepthAI 3.11.0.
+Calibrate several OAK 4 devices against each other, then show a merged point cloud, a calibrated
+panorama, or merged detections across their views. Browser UI, one Python process.
 
 ## Run
 
@@ -12,14 +12,26 @@ Ubuntu 22.04 or 24.04, the devices on the same network:
 ./run.sh         # then open http://localhost:8093
 ```
 
+Detections requires the updated `ImgDetectionsFilter` and Stitching source masks. Installation uses
+the snapshot pinned in [requirements-depthai.txt](requirements-depthai.txt), matching the oak-examples
+image-filter-detections tutorial. To use your own updated build: `./install.sh /path/to/depthai.whl`.
+
 1. Tick two or more devices.
 2. Point them at the same static, textured scene and press **Calibrate**.
-3. Press **Point cloud** (devices with a stereo pair) or **Panorama** (projection selectable next to it).
+3. Press **Point cloud** (devices with a stereo pair), **Panorama**, or **Detections** (stereo or single-camera devices).
+4. In **Detections**, view the panorama with merged detections in the embedded visualizer.
+   Expand **Detection filters** to change confidence, labels, box area, detection count, or duplicate
+   handling (**Off**, **NMS**, **Average**), then press **Apply filters** while running. Filters also
+   apply to the source camera overlays; duplicate merging happens in the panorama.
 
 Before each step the app checks PTP time sync on the devices over ssh and may ask for their root password
-(OAK 4 default `oelinux123`). Details and options: [USAGE.md](USAGE.md), `./run.sh --help`.
+(OAK 4 default `oelinux123`; leave blank for passwordless devices). Details and options:
+[USAGE.md](USAGE.md), `./run.sh --help`.
 
 ## Hand it to someone
 
 `./make_package.sh` builds `multi_device_app-<version>-ubuntu.zip` one folder up, with the DepthAI wheel
 included so the recipient only needs Python 3 and `./install.sh`.
+For a custom build, put only compatible updated DepthAI wheels in `wheels/` before packaging; otherwise
+the pinned snapshot is downloaded for Python 3.10 and 3.12. The first detection run also needs internet
+to download the model.

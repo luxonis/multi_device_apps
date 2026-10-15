@@ -12,14 +12,16 @@ NAME="multi_device_app-$VERSION-ubuntu"
 OUT="$OUTDIR/$NAME.zip"
 STAGE=$(mktemp -d)
 mkdir -p "$STAGE/$NAME/calibrations" "$STAGE/$NAME/wheels"
-cp app.py index.html install.sh run.sh README.md USAGE.md "$STAGE/$NAME/"
+cp app.py index.html install.sh run.sh README.md USAGE.md requirements-depthai.txt "$STAGE/$NAME/"
 cp -r visualizer "$STAGE/$NAME/"
 count=0
-for whl in wheels/*manylinux*.whl; do [ -e "$whl" ] && { cp "$whl" "$STAGE/$NAME/wheels/"; count=$((count + 1)); }; done
+for whl in wheels/depthai-*manylinux*.whl; do [ -e "$whl" ] && { cp "$whl" "$STAGE/$NAME/wheels/"; count=$((count + 1)); }; done
 if [ "$count" -eq 0 ]; then
-  echo "Downloading the depthai 3.11.0 wheel into wheels/"
-  python3 -m pip download depthai==3.11.0 --no-deps --only-binary=:all: --python-version 3.12 --platform manylinux_2_28_x86_64 -d wheels -q
-  cp wheels/*manylinux*.whl "$STAGE/$NAME/wheels/"
+  echo "Downloading the DepthAI snapshot into wheels/"
+  for pyver in 3.10 3.12; do
+    python3 -m pip download -r requirements-depthai.txt --no-deps --only-binary=:all: --python-version "$pyver" --implementation cp --abi "cp${pyver/./}" --abi abi3 --platform manylinux_2_28_x86_64 --platform manylinux2014_x86_64 -d wheels -q
+  done
+  cp wheels/depthai-*manylinux*.whl "$STAGE/$NAME/wheels/"
 fi
 rm -f "$OUT"
 (cd "$STAGE" && zip -qr "$OUT" "$NAME")
