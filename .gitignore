@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Captured frames (Capture button); keep the folder
+captures/*
+!captures/.gitkeep

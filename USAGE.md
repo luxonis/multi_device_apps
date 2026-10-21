@@ -1,7 +1,7 @@
 # Multi-device app (version 0.2)
 
 Pick two or more OAK 4 devices on your network, calibrate them against each other, then see one merged
-point cloud of all of them, a calibrated panorama, or merged image detections. Everything is in this folder:
+point cloud of all of them, a calibrated panorama, or merged image detections, or capture synchronized frames. Everything is in this folder:
 the app, the DepthAI visualizer and (in the zip) the updated DepthAI wheel. No other DepthAI installation is needed or
 touched.
 
@@ -83,6 +83,20 @@ Remapping uses camera rotation and intrinsics without depth or camera translatio
 retain parallax errors; evaluate merging with more distant objects and overlapping views. Boxes crossing
 a full 360-degree panorama seam are unsupported. This demonstrates image detection merging, without
 cross-camera tracking IDs or depth-aware spatial fusion.
+
+### Capture
+
+**Capture** (one or more devices, no calibration needed) saves one synchronized full-resolution frame of every selected
+camera: the stereo pair or the single camera chosen under each device, as for the calibration. It streams the cameras,
+lets the exposure settle and, with PTP, waits for the frame lock exactly like the calibration (`--warmup-seconds`,
+`--ptp-settle-ms`, `--ptp-settle-timeout`), then takes the next synchronized group. The frames are saved as PNG in
+`captures/<date>-<time>/` together with `capture.json` (device, socket, size, sequence number, the three timestamps of
+every frame, its offset to the earliest frame of the group in ms, the group spread and the PTP state). The page shows the
+result with the offsets; click a frame for the full-resolution PNG.
+
+Full resolution cannot stream continuously from several cameras over a 100 Mbit link, so every camera keeps its newest
+frames on the device and only the chosen frame crosses the network. Only small per-frame timestamp messages and 2 FPS
+previews stream while waiting. With a single device no PTP is involved.
 
 **Stop** ends the running mode. Recalibrate whenever a device is moved.
 

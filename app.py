@@ -19,7 +19,9 @@ sends the concatenated cloud to the DepthAI visualizer. "Panorama" feeds one und
 device into dai.beta.node.Stitching composed from the calibration (cylindrical, spherical or
 perspective surface) and streams the result to the page as MJPEG. "Detections" runs inference on each
 camera and uses ImgDetectionsFilter to remap and merge detections onto that panorama, with an overlay
-in the visualizer and live filter controls on the page.
+in the visualizer and live filter controls on the page. "Capture" streams the same cameras as the
+calibration, waits for the exposure and the PTP frame lock to settle and saves one synchronized
+full-resolution frame of every camera into captures/<timestamp>/ with the timestamps in capture.json.
 
     /usr/bin/python3 app.py            # then open http://localhost:8093
 """
@@ -52,6 +54,7 @@ import numpy as np  # noqa: E402
 APP_VERSION = "0.2"
 APP_DIR = Path(__file__).resolve().parent
 CALIBRATION_DIR = APP_DIR / "calibrations"
+CAPTURE_DIR = APP_DIR / "captures"  # one folder per Capture with the PNG frames and capture.json
 VISUALIZER_DIR = APP_DIR / "visualizer"  # DepthAI visualizer static files served by this app (if present)
 VISUALIZER_MIME = {".html": "text/html", ".css": "text/css", ".js": "application/javascript", ".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon", ".json": "application/json", ".txt": "text/plain", ".map": "application/json", ".woff": "font/woff", ".woff2": "font/woff2", ".wasm": "application/wasm"}
 POINT_CLOUD_TOPIC = "merged_point_cloud"
@@ -61,6 +64,29 @@ DETECTIONS_AVAILABLE = hasattr(dai.node, "ImgDetectionsFilter") and hasattr(dai,
 DETECTION_DEFAULTS = {"confidence": 0.5, "labels": None, "rejectLabels": None, "minArea": 0.0, "maxDetections": None, "overlap": "nms", "iou": 0.4}
 CAMERA_FPS = 10.0  # the PTP frame lock holds within ~0.01 ms at 10 FPS but wanders by 5-20 ms at 5 FPS
 PTP_CONF = "/etc/luxonis-ptp.conf"
+CAPTURE_TICK_SIZE = (128, 80)  # per-frame "tick" images that carry the timestamps of every camera to the host spread monitor
+CAPTURE_PREVIEW_FPS = 2.0  # page previews while capturing: 8 cameras at 640x400 and 2 FPS stay under half of a 100 Mbit link
+CAPTURE_RING = 10  # full-resolution frames each camera keeps on the device (1 s at 10 FPS) until the host asks for one
+# Runs on every captured camera: keeps the newest CAPTURE_RING full-resolution frames by sequence number and sends the
+# requested one to the host (the request is echoed back when that frame is no longer buffered). Streaming full
+# resolution continuously is impossible over a 100 Mbit link, so only the chosen frame crosses the network.
+CAPTURE_SCRIPT = """
+import time
+frames = {}
+order = []
+while True:
+    f = node.io['frames'].tryGet()
+    if f is not None:
+        frames[f.getSequenceNum()] = f
+        order.append(f.getSequenceNum())
+        while len(order) > RING:
+            frames.pop(order.pop(0), None)
+    req = node.io['request'].tryGet()
+    if req is not None:
+        f = frames.get(int(bytes(req.getData()).decode()))
+        node.io['out'].send(f if f is not None else req)
+    time.sleep(0.005)
+""".replace("RING", str(CAPTURE_RING))
 PTP_WARNING = "Devices are not PTP-synchronized: the calibration may be less precise."
 NO_SCALE_WARNING = "No device provides a stereo pair, so the metric scale must come from a measured distance between two cameras."
 
@@ -155,6 +181,11 @@ def extrinsics_matrix(ext):
     t = ext.translation
     scale = {dai.LengthUnit.METER: 1.0, dai.LengthUnit.CENTIMETER: 0.01, dai.LengthUnit.MILLIMETER: 0.001}.get(ext.lengthUnit, 1.0)
     return pose_matrix(ext.rotationMatrix, [t.x * scale, t.y * scale, t.z * scale])
+
+
+def seconds(timestamp):
+    """Seconds of a message timestamp: a timedelta (monotonic clocks) or a datetime (the PTP-disciplined system clock)."""
+    return timestamp.total_seconds() if hasattr(timestamp, "total_seconds") else timestamp.timestamp()
 
 
 def socket_name(socket):
@@ -301,6 +332,8 @@ class App:
         self.device_info = {}  # device name -> inspection dict (cameras, stereo pair, local origin)
         self.calibrations = {}  # path -> calibration info dict (metrics, poses)
         self.latest_calibration = None  # path of the result of the last calibration job
+        self.latest_capture = None  # info dict of the last Capture job of this session (files, timestamps, spread)
+        self.capture_thumbs = {}  # "<capture dir>/<file>" -> JPEG thumbnail bytes served to the page
         self.log_lines = collections.deque(maxlen=80)
         self.stop_event = threading.Event()
         self.job = None
@@ -324,6 +357,7 @@ class App:
             threading.Thread(target=visualizer_server.serve_forever, daemon=True).start()
         self.cloud_queue = self.remote.addTopic(POINT_CLOUD_TOPIC, "3d", maxSize=2, blocking=False)
         CALIBRATION_DIR.mkdir(exist_ok=True)
+        CAPTURE_DIR.mkdir(exist_ok=True)
         self._load_saved_calibrations()
         self.log(f"DepthAI {dai.__version__}")
         self.discover_async()
@@ -360,6 +394,7 @@ class App:
                 "deviceInfo": dict(self.device_info),
                 "calibrations": sorted(self.calibrations.values(), key=lambda c: c["time"], reverse=True),
                 "latestCalibration": self.latest_calibration,
+                "latestCapture": self.latest_capture,
                 "log": list(self.log_lines),
                 "version": APP_VERSION,
                 "busy": self.job is not None and self.job.is_alive(),
@@ -542,7 +577,7 @@ class App:
             self.ptp_skip_requested = False
             self.distance_request = None
             self.job_devices = list(job_args[0]) if job_args and isinstance(job_args[0], list) else []
-            self.last_job = name or {self._inspect_job: "inspect", self._calibrate: "calibrate", self._pointcloud: "pointcloud", self._panorama: "panorama"}.get(target)
+            self.last_job = name or {self._inspect_job: "inspect", self._calibrate: "calibrate", self._pointcloud: "pointcloud", self._panorama: "panorama", self._capture: "capture"}.get(target)
             self.streaming = False
             self.live = None
             self.stats = None
@@ -762,6 +797,52 @@ class App:
         self.log(f"PTP: master {master}, slaves {[ip for ip in device_names if ip != master]}" + (f"; configured {', '.join(changed)}" if changed else " (already configured)"))
         return True
 
+    def _wait_for_lock(self, pipeline, spread_queue, ptp, total, action):
+        """Streams until the auto exposure has warmed up (--warmup-seconds) and, with PTP, the frame timestamps of all
+        cameras have locked: 5 consecutive groups of the spread monitor within --ptp-settle-ms, or --ptp-settle-timeout
+        with a warning. Returns the number of monitor groups seen; raises InterruptedError when Stop was pressed."""
+        args = self.args
+        started = time.monotonic()
+        monitor_groups = 0
+        recent = collections.deque(maxlen=5)
+        settled = not ptp
+        self.set_state(
+            message="Warming up: letting the exposure settle" + (f" and waiting for PTP to lock the frames (spread below {args.ptp_settle_ms:g} ms)" if ptp else "") + "...",
+            progress={"stage": "warmup", "done": 0, "total": total, "percent": 0},
+        )
+        while pipeline.isRunning() and not self.stop_event.is_set():
+            for group in spread_queue.tryGetAll():
+                monitor_groups += 1
+                recent.append(group.getIntervalNs() / 1e6)
+                self.set_ptp(spreadMs=round(recent[-1], 2), spreadAt=time.monotonic(), groups=monitor_groups)
+            elapsed = time.monotonic() - started
+            warm = min(elapsed / args.warmup_seconds, 1.0) if args.warmup_seconds > 0 else 1.0
+            if warm < 1.0 or settled or not ptp:
+                self.set_state(progress={"stage": "warmup", "done": 0, "total": total, "percent": int(100 * warm)})
+            else:
+                locked = 0
+                for spread in reversed(recent):
+                    if spread >= args.ptp_settle_ms:
+                        break
+                    locked += 1
+                self.set_state(progress={"stage": "ptplock", "done": 0, "total": total, "percent": int(100 * locked / recent.maxlen) if locked else None,
+                                         "detail": f"frame spread {recent[-1]:.1f} ms, needs {recent.maxlen} groups below {args.ptp_settle_ms:g} ms" if recent else "waiting for the first synchronized frames"})
+            if ptp and len(recent) == recent.maxlen and max(recent) < args.ptp_settle_ms:
+                settled = True
+            if elapsed >= args.warmup_seconds and settled:
+                break
+            if ptp and elapsed >= args.ptp_settle_timeout:
+                self.set_ptp(warning=f"PTP did not settle within {args.ptp_settle_timeout:.0f} s (frame spread {max(recent) if recent else float('nan'):.1f} ms, limit {args.ptp_settle_ms:g} ms). {action} anyway; check that the switch passes PTP traffic.")
+                self.log(f"PTP did not settle: recent spreads {[round(x, 1) for x in recent]} ms")
+                break
+            time.sleep(0.05)
+        self.set_ptp(settled=settled if ptp else None)
+        if ptp and settled:
+            self.log(f"PTP settled: frame spread {max(recent):.2f} ms after {time.monotonic() - started:.1f} s")
+        if self.stop_event.is_set():
+            raise InterruptedError
+        return monitor_groups
+
     # ---------------------------------------------------------------- calibration
     def calibrate_async(self, device_names, modes, distances, ask_distances=False):
         return self._start_job(self._calibrate, device_names, modes or {}, distances or [], ask_distances)
@@ -877,45 +958,7 @@ class App:
             pipeline.start()
             collect_started = None
             try:
-                started = time.monotonic()
-                monitor_groups = 0
-                recent = collections.deque(maxlen=5)
-                settled = not ptp
-                self.set_state(
-                    message="Warming up: letting the exposure settle" + (f" and waiting for PTP to lock the frames (spread below {args.ptp_settle_ms:g} ms)" if ptp else "") + "...",
-                    progress={"stage": "warmup", "done": 0, "total": args.sample_count, "percent": 0},
-                )
-                while pipeline.isRunning() and not self.stop_event.is_set():
-                    for group in spread_queue.tryGetAll():
-                        monitor_groups += 1
-                        recent.append(group.getIntervalNs() / 1e6)
-                        self.set_ptp(spreadMs=round(recent[-1], 2), spreadAt=time.monotonic(), groups=monitor_groups)
-                    elapsed = time.monotonic() - started
-                    warm = min(elapsed / args.warmup_seconds, 1.0) if args.warmup_seconds > 0 else 1.0
-                    if warm < 1.0 or settled or not ptp:
-                        self.set_state(progress={"stage": "warmup", "done": 0, "total": args.sample_count, "percent": int(100 * warm)})
-                    else:
-                        locked = 0
-                        for spread in reversed(recent):
-                            if spread >= args.ptp_settle_ms:
-                                break
-                            locked += 1
-                        self.set_state(progress={"stage": "ptplock", "done": 0, "total": args.sample_count, "percent": int(100 * locked / recent.maxlen) if locked else None,
-                                                 "detail": f"frame spread {recent[-1]:.1f} ms, needs {recent.maxlen} groups below {args.ptp_settle_ms:g} ms" if recent else "waiting for the first synchronized frames"})
-                    if ptp and len(recent) == recent.maxlen and max(recent) < args.ptp_settle_ms:
-                        settled = True
-                    if elapsed >= args.warmup_seconds and settled:
-                        break
-                    if ptp and elapsed >= args.ptp_settle_timeout:
-                        self.set_ptp(warning=f"PTP did not settle within {args.ptp_settle_timeout:.0f} s (frame spread {max(recent) if recent else float('nan'):.1f} ms, limit {args.ptp_settle_ms:g} ms). Calibrating anyway; check that the switch passes PTP traffic.")
-                        self.log(f"PTP did not settle: recent spreads {[round(x, 1) for x in recent]} ms")
-                        break
-                    time.sleep(0.05)
-                self.set_ptp(settled=settled if ptp else None)
-                if ptp and settled:
-                    self.log(f"PTP settled: frame spread {max(recent):.2f} ms after {time.monotonic() - started:.1f} s")
-                if self.stop_event.is_set():
-                    raise InterruptedError
+                monitor_groups = self._wait_for_lock(pipeline, spread_queue, ptp, args.sample_count, "Calibrating")
                 group_queue.tryGetAll()
                 collect_started = time.monotonic()
                 control_queue.send(dai.beta.MultiDeviceCalibrationControl.start())
@@ -984,6 +1027,196 @@ class App:
             self.latest_calibration = str(path)
         self.log(f"Calibration saved to {path.name} (confidence {info['confidence']}, Sampson error {info['sampsonError']})")
         self.set_state("idle", f"Calibrated {len(device_ids)} devices.", progress=None)
+
+    # ---------------------------------------------------------------- capture
+    def capture_async(self, device_names, modes):
+        return self._start_job(self._capture, device_names, modes)
+
+    def _capture(self, device_names, modes):
+        """Saves one synchronized full-resolution frame of every registered camera (the stereo pair or the chosen
+        single camera of each device, as for the calibration) once the exposure and, with PTP, the frame lock have
+        settled. The frames go to captures/<timestamp>/ as PNG with the timestamps and the spread in capture.json."""
+        args = self.args
+        self.set_state("capturing", "Checking the devices...", progress={"stage": "inspecting", "done": 0, "total": 1, "percent": None}, stats=None)
+        self.log(f"Capture of {device_names} started")
+        self._inspect(device_names)
+        self.set_state("capturing")
+        registered = {name: self._cameras_for_mode(self.device_info[name], modes.get(name))[0] for name in device_names}
+        for name in device_names:
+            self.log(f"{name}: capturing {' + '.join(registered[name])}")
+        self.set_state(progress={"stage": "ptp", "done": 0, "total": 1, "percent": None})
+        if len(device_names) > 1:
+            ptp = self._prepare_ptp(device_names)
+        else:
+            ptp = False  # a single device has nothing to synchronize with
+            self.set_ptp(active=False, warning=None, master=None, needPassword=[], spreadMs=None, spreadAt=None, groups=0, settled=None)
+        if self.stop_event.is_set():
+            self.set_state("idle", "Capture stopped.", progress=None)
+            return
+        self.set_state("capturing", "Connecting to devices...", progress={"stage": "connecting", "done": 0, "total": 1, "percent": None})
+        captured = []
+        device_ids = {}
+        spread_ms = None
+        with dai.Pipeline(createImplicitDevice=False) as pipeline:
+            pipeline.setAutoCalibrationMode(dai.Pipeline.AutoCalibrationMode.OFF)
+            # One group = the ticks of every camera from the same capture slot. The threshold is just under a frame
+            # period with PTP (frames of neighbouring slots never mix) and a full period for free-running cameras,
+            # which can never be closer than that
+            sync = pipeline.create(dai.node.Sync)
+            sync.setRunOnHost(True)
+            sync.setSyncThreshold(timedelta(milliseconds=(900.0 if ptp else 1000.0) / args.fps))
+            sync.setSyncAttempts(-1)
+            sync.setTimestampSource(dai.node.Sync.TimestampSource.SYSTEM if ptp else dai.node.Sync.TimestampSource.HOST)
+            streams = []  # (device name, socket, sync input / preview name, request queue, full-frame queue)
+            for name in device_names:
+                device = pipeline.addDevice(dai.DeviceInfo(name))
+                device_ids[name] = device.getDeviceId()
+                for socket_str in registered[name]:
+                    camera = pipeline.create(dai.node.Camera, device).build(socket_from_name(socket_str), sensorFps=args.fps)
+                    camera.setOutputsNumFramesPool(2 * CAPTURE_RING)  # the ring holds CAPTURE_RING of them; the default pool stalls the camera
+                    if ptp:
+                        camera.initialControl.setFrameSyncMode(dai.CameraControl.FrameSyncMode.TIME_PTP)
+                    key = f"{name} {socket_str}"
+                    sync_input = sync.inputs[key]
+                    sync_input.setBlocking(False)
+                    sync_input.setMaxSize(8)
+                    camera.requestOutput(CAPTURE_TICK_SIZE, fps=args.fps).link(sync_input)
+                    ring = pipeline.create(dai.node.Script, device)
+                    ring.setScript(CAPTURE_SCRIPT)
+                    ring.inputs["frames"].setBlocking(False)
+                    ring.inputs["frames"].setMaxSize(4)
+                    camera.requestFullResolutionOutput(fps=args.fps).link(ring.inputs["frames"])
+                    preview = camera.requestOutput((640, 400), fps=min(CAPTURE_PREVIEW_FPS, args.fps))
+                    with self.lock:
+                        self.previews[key] = {"queue": preview.createOutputQueue(maxSize=1, blocking=False), "jpeg": None}
+                    streams.append((name, socket_str, key, ring.inputs["request"].createInputQueue(), ring.outputs["out"].createOutputQueue(maxSize=4, blocking=False)))
+                self.log(f"{name}: {device.getDeviceName()} ({device_ids[name]})")
+            group_queue = sync.out.createOutputQueue(maxSize=8, blocking=False)
+            pipeline.start()
+            try:
+                groups = self._wait_for_lock(pipeline, group_queue, ptp, 1, "Capturing")
+                self.set_state(message="Capturing one synchronized frame of every camera...", progress={"stage": "capturing", "done": 0, "total": 1, "percent": None})
+                group_queue.tryGetAll()  # only a group captured after the lock counts
+                group = None
+                deadline = time.monotonic() + max(5.0, 5 * 1000.0 / args.fps)
+                while pipeline.isRunning() and not self.stop_event.is_set() and time.monotonic() < deadline:
+                    group = group_queue.tryGet()
+                    if group is not None:
+                        break
+                    time.sleep(0.02)
+                if self.stop_event.is_set():
+                    raise InterruptedError
+                if group is None:
+                    raise RuntimeError("No synchronized frame group arrived: the cameras are not delivering frames in step.")
+                spread_ms = group.getIntervalNs() / 1e6
+                self.set_ptp(spreadMs=round(spread_ms, 2), spreadAt=time.monotonic(), groups=groups + 1)
+                # Ask every camera's ring for the full-resolution frame with the sequence number of its tick in the group
+                wanted = {}
+                for name, socket_str, key, request_queue, _ in streams:
+                    wanted[key] = group[key].getSequenceNum()
+                    request = dai.Buffer()
+                    request.setData(list(str(wanted[key]).encode()))
+                    request_queue.send(request)
+                self.log(f"Synchronized group with a spread of {spread_ms:.2f} ms; fetching the full-resolution frames " + ", ".join(f"{key} #{seq}" for key, seq in wanted.items()))
+                pending = {key: (name, socket_str, frame_queue) for name, socket_str, key, _, frame_queue in streams}
+                deadline = time.monotonic() + 30.0  # full frames of all cameras over a 100 Mbit link
+                while pending and pipeline.isRunning() and not self.stop_event.is_set() and time.monotonic() < deadline:
+                    for key in list(pending):
+                        name, socket_str, frame_queue = pending[key]
+                        message = frame_queue.tryGet()
+                        if message is None:
+                            continue
+                        if not isinstance(message, dai.ImgFrame):
+                            raise RuntimeError(f"{key}: frame #{wanted[key]} was no longer buffered on the device when the request arrived; try again.")
+                        if message.getSequenceNum() != wanted[key]:
+                            self.log(f"{key}: ignoring frame #{message.getSequenceNum()}, waiting for #{wanted[key]}")
+                            continue
+                        captured.append({
+                            "device": name, "deviceId": device_ids[name], "socket": socket_str, "image": message.getCvFrame(),
+                            "width": message.getWidth(), "height": message.getHeight(), "type": str(message.getType()).split(".")[-1], "sequenceNum": message.getSequenceNum(),
+                            "timestamp_s": seconds(message.getTimestamp()), "timestampDevice_s": seconds(message.getTimestampDevice()), "timestampSystem_s": seconds(message.getTimestampSystem()),
+                        })
+                        del pending[key]
+                        self.set_state(progress={"stage": "capturing", "done": len(captured), "total": len(streams), "percent": int(100 * len(captured) / len(streams)),
+                                                 "detail": f"{len(captured)} of {len(streams)} full-resolution frames received"})
+                    time.sleep(0.02)
+                if self.stop_event.is_set():
+                    raise InterruptedError
+                if pending:
+                    raise RuntimeError(f"Full-resolution frames of {', '.join(pending)} did not arrive within 30 s.")
+            except InterruptedError:
+                captured = []
+            finally:
+                with self.lock:
+                    self.previews = {}
+                pipeline.stop()
+        if not captured:
+            self.log("Capture stopped")
+            self.set_state("idle", "Capture stopped.", progress=None)
+            return
+
+        self.set_state(message="Saving the frames...", progress={"stage": "saving", "done": 0, "total": 1, "percent": None})
+        order = [(name, socket_str) for name, socket_str, *_ in streams]
+        captured.sort(key=lambda c: order.index((c["device"], c["socket"])))  # device order, not arrival order
+        now = time.time()
+        folder = CAPTURE_DIR / time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+        folder.mkdir(parents=True, exist_ok=True)
+        source = "timestampSystem_s" if ptp else "timestamp_s"  # the clock the Sync grouped by
+        first = min(c[source] for c in captured)
+        thumbs = {}
+        frames = []
+        for c in captured:
+            file = f"{c['device']}_{c['socket']}.png".replace("/", "_").replace(" ", "_")
+            if not cv2.imwrite(str(folder / file), c["image"]):
+                raise RuntimeError(f"Failed to write {folder / file}")
+            thumbs[file] = self._thumbnail(c["image"])
+            frames.append({**{k: v for k, v in c.items() if k != "image"}, "file": file, "offsetMs": round((c[source] - first) * 1000.0, 3)})
+        with self.lock:
+            ptp_summary = {"active": self.ptp["active"], "settled": self.ptp["settled"], "master": self.ptp["master"], "warning": self.ptp["warning"]}
+        info = {
+            "dir": folder.name, "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), "fps": args.fps, "spreadMs": round(spread_ms, 3),
+            "ptp": ptp_summary,
+            "devices": [{"name": name, "deviceId": device_ids[name], "product": self.device_info[name]["productName"], "sockets": registered[name]} for name in device_names],
+            "frames": frames,
+        }
+        (folder / "capture.json").write_text(json.dumps(info, indent=1))
+        with self.lock:
+            self.latest_capture = info
+            self.capture_thumbs = {f"{folder.name}/{file}": jpeg for file, jpeg in thumbs.items() if jpeg is not None}
+        for f in frames:
+            self.log(f"{f['device']} {f['socket']}: {f['width']}x{f['height']} {f['type']}, seq {f['sequenceNum']}, {f['offsetMs']:+.2f} ms -> {f['file']}")
+        sync_label = "PTP locked" if ptp_summary["settled"] else "PTP not settled" if ptp else "no PTP"
+        self.log(f"Captured {len(frames)} frames with a timestamp spread of {spread_ms:.2f} ms ({sync_label}) into captures/{folder.name}")
+        self.set_state("idle", f"Captured {len(frames)} frames ({spread_ms:.2f} ms spread, {sync_label}) into captures/{folder.name}.", progress=None)
+
+    @staticmethod
+    def _thumbnail(image, width=640):
+        """JPEG bytes of the image scaled down to at most `width` pixels wide (None when encoding fails)."""
+        h, w = image.shape[:2]
+        if w > width:
+            image = cv2.resize(image, (width, max(1, round(h * width / w))), interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return encoded.tobytes() if ok else None
+
+    def capture_file(self, relative, thumb=False):
+        """(bytes, content type) of a file in captures/, or its 640-wide JPEG thumbnail; None when there is no such file."""
+        if thumb:
+            with self.lock:
+                jpeg = self.capture_thumbs.get(relative)
+            if jpeg is not None:
+                return jpeg, "image/jpeg"
+        path = (CAPTURE_DIR / relative).resolve()
+        if CAPTURE_DIR.resolve() not in path.parents or not path.is_file():
+            return None
+        if thumb:
+            image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            jpeg = self._thumbnail(image) if image is not None else None
+            if jpeg is None:
+                return None
+            with self.lock:
+                self.capture_thumbs[relative] = jpeg
+            return jpeg, "image/jpeg"
+        return path.read_bytes(), VISUALIZER_MIME.get(path.suffix, "application/octet-stream")
 
     # ---------------------------------------------------------------- shared by the run modes
     def _require_calibration(self, device_names):
@@ -1432,6 +1665,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(jpeg)))
             self.end_headers()
             self.wfile.write(jpeg)
+        elif self.path.startswith("/api/capture/"):
+            from urllib.parse import unquote
+
+            relative, _, query = self.path[len("/api/capture/"):].partition("?")
+            found = self.app.capture_file(unquote(relative), thumb="thumb" in query)
+            if found is None:
+                return self._json({"error": "not found"}, 404)
+            data, mime = found
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Cache-Control", "max-age=3600")  # captures never change once written
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
         elif self.path.startswith("/api/preview/"):
             from urllib.parse import unquote
 
@@ -1461,6 +1708,10 @@ class Handler(BaseHTTPRequestHandler):
             if len(devices) < 2:
                 return self._json({"error": "Select at least two devices"}, 400)
             ok = self.app.calibrate_async(devices, body.get("modes") or {}, body.get("distances"), bool(body.get("askDistances")))
+        elif self.path == "/api/capture":
+            if not devices:
+                return self._json({"error": "Select at least one device"}, 400)
+            ok = self.app.capture_async(devices, body.get("modes") or {})
         elif self.path == "/api/pointcloud":
             if len(devices) < 2:
                 return self._json({"error": "Select at least two devices"}, 400)

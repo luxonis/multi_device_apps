@@ -11,7 +11,7 @@ VERSION=$(sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' app.py)
 NAME="multi_device_app-$VERSION-ubuntu"
 OUT="$OUTDIR/$NAME.zip"
 STAGE=$(mktemp -d)
-mkdir -p "$STAGE/$NAME/calibrations" "$STAGE/$NAME/wheels"
+mkdir -p "$STAGE/$NAME/calibrations" "$STAGE/$NAME/captures" "$STAGE/$NAME/wheels"
 cp app.py index.html install.sh run.sh README.md USAGE.md requirements-depthai.txt "$STAGE/$NAME/"
 cp -r visualizer "$STAGE/$NAME/"
 count=0

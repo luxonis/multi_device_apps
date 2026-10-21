@@ -12,7 +12,7 @@
   header { display:flex; align-items:center; gap:12px; padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line); }
   header h1 { font-size:16px; margin:0; }
   .dot { width:10px; height:10px; border-radius:50%; background:#aab; }
-  .dot.calibrating, .dot.discovering, .dot.inspecting { background:var(--warn); animation:pulse 1s infinite; }
+  .dot.calibrating, .dot.capturing, .dot.discovering, .dot.inspecting { background:var(--warn); animation:pulse 1s infinite; }
   .dot.pointcloud, .dot.panorama, .dot.detections { background:var(--ok); animation:pulse 1s infinite; }
   .dot.error { background:var(--err); }
   .dot.ptp_password, .dot.distance_input { background:var(--accent); animation:pulse 1s infinite; }
@@ -52,7 +52,7 @@
   button.small { padding:3px 8px; font-size:12px; }
   .option { font-size:12.5px; color:var(--muted); display:flex; gap:6px; align-items:center; margin-top:8px; }
   .status-card { border-radius:8px; background:var(--bg); border-left:5px solid #aab; padding:12px 14px; display:flex; flex-direction:column; gap:8px; }
-  .status-card.calibrating, .status-card.ptp_password, .status-card.distance_input, .status-card.inspecting { border-left-color:var(--warn); background:#fff7ea; }
+  .status-card.calibrating, .status-card.capturing, .status-card.ptp_password, .status-card.distance_input, .status-card.inspecting { border-left-color:var(--warn); background:#fff7ea; }
   .status-card.discovering { border-left-color:var(--accent); background:#f1efff; }
   .status-card.pointcloud, .status-card.panorama, .status-card.detections { border-left-color:var(--ok); background:#eef9f2; }
   .status-card.error { border-left-color:var(--err); background:#fdecec; }
@@ -123,6 +123,8 @@
   .previews img { width:100%; height:100%; object-fit:contain; display:block; }
   .previews figcaption { position:absolute; left:0; bottom:0; padding:3px 8px; font-size:12px; color:#fff; background:rgba(0,0,0,.55); border-top-right-radius:6px; }
   .previews .title { grid-column:1 / -1; color:#d6dde6; font-size:13px; }
+  .previews .title button { margin-left:10px; vertical-align:middle; }
+  .previews figure a { display:block; width:100%; height:100%; }
   @media (max-width: 900px) { main { grid-template-columns:1fr; grid-template-rows:auto 60vh; } aside { border-right:0; border-bottom:1px solid var(--line); } }
 </style>
 </head>
@@ -140,6 +142,7 @@
       <div class="actions">
         <button id="inspect">Check devices</button>
         <button class="primary" id="calibrate">Calibrate</button>
+        <button id="capture" title="Save one synchronized full-resolution frame of every selected camera into captures/ (with PTP, after the frames have locked)">Capture</button>
         <button class="danger" id="stop">Stop</button>
       </div>
       <div class="actions" style="margin-top:8px">
@@ -214,6 +217,7 @@
     </div>
     <div class="previews" id="previews" hidden></div>
     <div class="guide" id="guide" hidden><div class="card" id="guideCard"></div></div>
+    <div class="previews" id="captureView" hidden></div>
   </div>
 </main>
 <div class="modal-backdrop" id="pwModal" hidden>
@@ -250,7 +254,7 @@ let shownCalibration = null;  // path of the calibration shown in the 3D view an
 let shownFollowsLatest = true;
 
 // ------------------------------------------------------------------ previews while calibrating
-function renderPreviews(names) {
+function renderPreviews(names, capturing) {
   const box = $('previews');
   if (names.join('|') !== previewNames.join('|')) {
     previewNames = names;
@@ -260,7 +264,8 @@ function renderPreviews(names) {
       box.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
       const title = document.createElement('div');
       title.className = 'title';
-      title.textContent = `Calibration streams (${names.length}). Every camera should see the same static, textured scene.`;
+      title.textContent = capturing ? `Capture streams (${names.length}). One synchronized full-resolution frame of every camera is saved once the frames have locked.`
+                                    : `Calibration streams (${names.length}). Every camera should see the same static, textured scene.`;
       box.appendChild(title);
       for (const name of names) {
         const fig = document.createElement('figure');
@@ -288,6 +293,47 @@ function refreshPreviews() {
     next.onerror = () => { delete img.dataset.loading; };
     next.src = `/api/preview/${encodeURIComponent(img.dataset.name)}?t=${Date.now()}`;
   }
+}
+
+// ------------------------------------------------------------------ result of the last capture
+let renderedCapture = '';
+let dismissedCapture = null;
+function renderCapture(s) {
+  const box = $('captureView');
+  const c = s.latestCapture;
+  const show = !!c && s.lastJob === 'capture' && !s.busy && dismissedCapture !== c.dir;
+  box.hidden = !show;
+  if (!show) { renderedCapture = ''; return false; }
+  if (renderedCapture === c.dir) return true;
+  renderedCapture = c.dir;
+  box.innerHTML = '';
+  const cols = Math.ceil(Math.sqrt(c.frames.length * 1.2));
+  box.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+  const title = document.createElement('div');
+  title.className = 'title';
+  const sync = c.ptp && c.ptp.active ? (c.ptp.settled ? 'PTP locked' : 'PTP not settled') : 'no PTP';
+  title.textContent = `Capture ${c.time}: ${c.frames.length} frames, timestamp spread ${c.spreadMs.toFixed(2)} ms (${sync}), saved in captures/${c.dir}. Click a frame for the full-resolution PNG.`;
+  const close = document.createElement('button');
+  close.className = 'small';
+  close.textContent = 'Close';
+  close.onclick = () => { dismissedCapture = c.dir; render(state); };
+  title.appendChild(close);
+  box.appendChild(title);
+  for (const f of c.frames) {
+    const fig = document.createElement('figure');
+    const link = document.createElement('a');
+    link.href = `/api/capture/${encodeURIComponent(c.dir)}/${encodeURIComponent(f.file)}`;
+    link.target = '_blank';
+    const img = document.createElement('img');
+    img.src = link.href + '?thumb';
+    img.alt = f.file;
+    link.appendChild(img);
+    const cap = document.createElement('figcaption');
+    cap.textContent = `${f.device} ${f.socket} · ${f.width}×${f.height} · seq ${f.sequenceNum} · ${f.offsetMs >= 0 ? '+' : ''}${f.offsetMs.toFixed(2)} ms`;
+    fig.append(link, cap);
+    box.appendChild(fig);
+  }
+  return true;
 }
 
 function selectedDevices() { return [...selected]; }
@@ -401,6 +447,7 @@ function updateButtons() {
   $('devCount').textContent = busy && state.jobDevices && state.jobDevices.length ? `· ${state.jobDevices.length} in use` : n ? `· ${n} selected${inspected ? `, ${inspected} checked` : ''}` : '';
   $('inspect').disabled = busy || n < 1;
   $('calibrate').disabled = busy || n < 2;
+  $('capture').disabled = busy || n < 1;
   const covered = n >= 2 && hasCalibration(selectedDevices());
   const stereo = selectedDevices().every(d => !state.deviceInfo[d] || state.deviceInfo[d].stereoPair);
   $('pointcloud').disabled = busy || !covered || !stereo;
@@ -460,14 +507,15 @@ function render(s) {
   state = s;
   if (s.version) $('version').textContent = 'v' + s.version;
   $('dot').className = 'dot ' + s.phase;
-  $('phase').textContent = { idle: 'Ready', discovering: 'Searching devices', inspecting: 'Checking devices', calibrating: 'Calibrating', ptp_password: 'Waiting for passwords', distance_input: 'Waiting for distances', pointcloud: 'Point cloud', panorama: 'Panorama', detections: 'Detections', error: 'Error' }[s.phase] || s.phase;
+  $('phase').textContent = { idle: 'Ready', discovering: 'Searching devices', inspecting: 'Checking devices', calibrating: 'Calibrating', capturing: 'Capturing', ptp_password: 'Waiting for passwords', distance_input: 'Waiting for distances', pointcloud: 'Point cloud', panorama: 'Panorama', detections: 'Detections', error: 'Error' }[s.phase] || s.phase;
   $('statusCard').className = 'status-card ' + s.phase;
   $('message').textContent = s.message;
   const p = $('progress');
   const pr = s.progress;
-  p.hidden = !pr || s.phase !== 'calibrating';
-  if (pr && s.phase === 'calibrating') {
-    const stage = { inspecting: 'Checking devices', ptp: 'Checking PTP', connecting: 'Connecting to devices', warmup: 'Warming up (exposure)', ptplock: 'Waiting for PTP to lock the frames', collecting: 'Collecting calibration data', solving: 'Solving', stopping: 'Stopping' }[pr.stage] || '';
+  const staged = s.phase === 'calibrating' || s.phase === 'capturing';
+  p.hidden = !pr || !staged;
+  if (pr && staged) {
+    const stage = { inspecting: 'Checking devices', ptp: 'Checking PTP', connecting: 'Connecting to devices', warmup: 'Warming up (exposure)', ptplock: 'Waiting for PTP to lock the frames', collecting: 'Collecting calibration data', solving: 'Solving', stopping: 'Stopping', capturing: 'Capturing the frames', saving: 'Saving the frames' }[pr.stage] || '';
     const indeterminate = pr.percent == null;
     $('barStage').textContent = stage;
     $('barPercent').textContent = indeterminate ? '' : `${pr.percent}%`;
@@ -477,7 +525,8 @@ function render(s) {
   }
   renderDevices(s.devices, s.calibrations);
   updateButtons();
-  renderPreviews(s.phase === 'calibrating' ? s.previews : []);
+  renderPreviews(s.phase === 'calibrating' || s.phase === 'capturing' ? s.previews : [], s.phase === 'capturing');
+  const captureShown = renderCapture(s);
   renderPtp(s);
   renderDistanceModal(s);
 
@@ -488,7 +537,7 @@ function render(s) {
   renderMetrics(shown);
   scene.setCalibration(shown);
   renderLive(s);
-  renderGuide(s, shown);
+  renderGuide(s, shown, captureShown);
 
   $('calSection').hidden = !s.calibrations.length;
   $('calCount').textContent = s.calibrations.length ? `(${s.calibrations.length})` : '';
@@ -533,22 +582,22 @@ function renderLive(s) {
 function renderSpread(s) {
   const ptp = s.ptp || {};
   const box = $('spread');
-  box.hidden = !['calibrating', 'pointcloud', 'panorama', 'detections'].includes(s.phase) || ptp.spreadMs == null;
+  box.hidden = !['calibrating', 'capturing', 'pointcloud', 'panorama', 'detections'].includes(s.phase) || ptp.spreadMs == null;
   if (box.hidden) return;
   const v = $('spreadValue');
   v.textContent = `${ptp.spreadMs.toFixed(2)} ms`;
   v.className = 'value ' + (ptp.spreadMs < 5 ? 'good' : ptp.spreadMs < 50 ? 'fair' : 'bad');
   const stale = ptp.spreadAge != null && ptp.spreadAge > 2;
-  $('spreadNote').textContent = (ptp.active ? 'PTP' : 'no PTP') + (s.phase === 'calibrating' ? ', between all cameras' : ', between the devices') + (stale ? `, last group ${ptp.spreadAge.toFixed(0)} s ago` : '');
+  $('spreadNote').textContent = (ptp.active ? 'PTP' : 'no PTP') + (s.phase === 'calibrating' || s.phase === 'capturing' ? ', between all cameras' : ', between the devices') + (stale ? `, last group ${ptp.spreadAge.toFixed(0)} s ago` : '');
 }
 
-function renderGuide(s, shown) {
+function renderGuide(s, shown, captureShown) {
   const box = $('guide');
-  const calibrating = s.phase === 'calibrating' && s.previews && s.previews.length;
+  const calibrating = (s.phase === 'calibrating' || s.phase === 'capturing') && s.previews && s.previews.length;
   const running = ['pointcloud', 'panorama', 'detections'].includes(s.phase);
-  const show = !calibrating && !(running && s.streaming) && (!shown || s.busy || s.phase === 'error');
+  const show = !calibrating && !captureShown && !(running && s.streaming) && (!shown || s.busy || s.phase === 'error');
   box.hidden = !show;
-  $('viewtools').hidden = show || calibrating || running;
+  $('viewtools').hidden = show || calibrating || captureShown || running;
   if (!show) return;
   let html;
   const n = selected.size;
@@ -558,8 +607,8 @@ function renderGuide(s, shown) {
     html = `<h3><span class="spinner"></span>Starting the panorama</h3><p>${s.message}</p>`;
   } else if (s.phase === 'detections') {
     html = `<h3><span class="spinner"></span>Starting detections</h3><p>${s.message}</p>`;
-  } else if (s.phase === 'calibrating' || s.phase === 'ptp_password' || s.phase === 'distance_input') {
-    html = `<h3><span class="spinner"></span>${s.lastJob === 'pointcloud' ? 'Starting the point cloud' : s.lastJob === 'panorama' ? 'Starting the panorama' : s.lastJob === 'detections' ? 'Starting detections' : 'Calibrating'}</h3><p>${s.message}</p>`;
+  } else if (s.phase === 'calibrating' || s.phase === 'capturing' || s.phase === 'ptp_password' || s.phase === 'distance_input') {
+    html = `<h3><span class="spinner"></span>${s.lastJob === 'pointcloud' ? 'Starting the point cloud' : s.lastJob === 'panorama' ? 'Starting the panorama' : s.lastJob === 'detections' ? 'Starting detections' : s.lastJob === 'capture' ? 'Capturing' : 'Calibrating'}</h3><p>${s.message}</p>`;
   } else if (s.phase === 'inspecting') {
     html = `<h3><span class="spinner"></span>Checking devices</h3><p>${s.message}</p>`;
   } else if (s.phase === 'discovering') {
@@ -567,7 +616,7 @@ function renderGuide(s, shown) {
   } else if (s.phase === 'error' && s.lastJob === 'calibrate') {
     html = `<h3>Calibration failed</h3><p style="color:var(--err)">${s.message}</p><ol><li>All cameras must see <b>the same part of the scene</b> (overlap of 25 % or more).</li><li>The scene must be <b>textured and lit</b>, not a blank wall.</li><li>Keep the devices still.</li></ol>`;
   } else {
-    html = `<h3>Get started</h3><ol><li>Tick two or more devices.</li><li>Point them at the same static, textured scene and keep them still.</li><li>Press <b>Calibrate</b>.</li><li>Then <b>Point cloud</b> (stereo devices), <b>Panorama</b> or <b>Detections</b>.</li></ol><p style="margin-top:10px;font-size:13px">Devices with a stereo pair use it for the metric scale; otherwise you are asked for a measured camera distance.</p>` + (s.phase === 'error' ? `<p style="margin-top:10px;color:var(--err)">${s.message}</p>` : '');
+    html = `<h3>Get started</h3><ol><li>Tick two or more devices.</li><li>Point them at the same static, textured scene and keep them still.</li><li>Press <b>Calibrate</b>.</li><li>Then <b>Point cloud</b> (stereo devices), <b>Panorama</b> or <b>Detections</b>.</li></ol><p style="margin-top:10px;font-size:13px"><b>Capture</b> saves one synchronized full-resolution frame of every selected camera into <code>captures/</code>, waiting for the PTP frame lock first.</p><p style="margin-top:10px;font-size:13px">Devices with a stereo pair use it for the metric scale; otherwise you are asked for a measured camera distance.</p>` + (s.phase === 'error' ? `<p style="margin-top:10px;color:var(--err)">${s.message}</p>` : '');
   }
   if ($('guideCard').innerHTML !== html) $('guideCard').innerHTML = html;
 }
@@ -578,11 +627,11 @@ let modalNeed = [];
 function renderPtp(s) {
   const ptp = s.ptp || {};
   const warn = $('ptpWarning');
-  warn.hidden = !ptp.warning || !(s.busy || s.lastJob === 'calibrate');
+  warn.hidden = !ptp.warning || !(s.busy || s.lastJob === 'calibrate' || s.lastJob === 'capture');
   warn.textContent = ptp.warning || '';
   const info = $('ptpInfo');
   const parts = [];
-  if (ptp.active && s.phase === 'calibrating') parts.push(`PTP active, master ${ptp.master}`, ptp.settled === true ? 'frames locked' : ptp.groups ? 'waiting for the frames to lock' : 'no synchronized group yet');
+  if (ptp.active && (s.phase === 'calibrating' || s.phase === 'capturing')) parts.push(`PTP active, master ${ptp.master}`, ptp.settled === true ? 'frames locked' : ptp.groups ? 'waiting for the frames to lock' : 'no synchronized group yet');
   renderSpread(s);
   info.hidden = !parts.length;
   info.textContent = parts.join(' · ');
@@ -887,6 +936,12 @@ $('calibrate').onclick = () => {
   const chosen = {}; for (const d of devices) if (modes[d]) chosen[d] = modes[d];
   shownFollowsLatest = true;
   post('/api/calibrate', { devices, modes: chosen, askDistances: $('askDistances').checked });
+};
+$('capture').onclick = () => {
+  const devices = selectedDevices();
+  const chosen = {}; for (const d of devices) if (modes[d]) chosen[d] = modes[d];
+  dismissedCapture = null;
+  post('/api/capture', { devices, modes: chosen });
 };
 $('pointcloud').onclick = () => post('/api/pointcloud', { devices: selectedDevices() });
 $('panorama').onclick = () => post('/api/panorama', { devices: selectedDevices(), projection: $('projection').value });
