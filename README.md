@@ -16,13 +16,15 @@ Detections requires the updated `ImgDetectionsFilter` and Stitching source masks
 the snapshot pinned in [requirements-depthai.txt](requirements-depthai.txt), matching the oak-examples
 image-filter-detections tutorial. To use your own updated build: `./install.sh /path/to/depthai.whl`.
 
-1. Tick two or more devices.
+1. Tick two or more devices; each is checked for its cameras when ticked.
 2. Point them at the same static, textured scene and press **Calibrate**.
 3. Press **Point cloud** (devices with a stereo pair), **Panorama**, or **Detections** (stereo or single-camera devices).
 4. **Capture → Capture frames** saves the calibration material to `captures/<timestamp>/`: the same number of
    synchronized full-resolution image groups the calibration collects, the timestamps in `capture.json` and the factory
    calibration of every device, so the setup can be calibrated offline. **Capture point cloud** saves one merged point
    cloud of the stereo devices as PLY. Both first wait for the PTP frame lock.
+5. **⚙ Settings** (bottom left) changes the panorama projection, the image groups per calibration and capture, the
+   PTP lock limits, and the depth model, size and range. They are kept in `settings.json`.
 4. In **Detections**, view the panorama with merged detections in the embedded visualizer.
    Expand **Detection filters** to change confidence, labels, box area, detection count, or duplicate
    handling (**Off**, **NMS**, **Average**), then press **Apply filters** while running. Filters also

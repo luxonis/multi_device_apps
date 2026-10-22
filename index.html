@@ -93,7 +93,9 @@
   .callist tr { cursor:pointer; }
   .callist tr.shown td { background:#f1efff; }
   .log { font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background:#1d232b; color:#d6dde6; border-radius:6px; padding:8px 10px; height:200px; overflow:auto; white-space:pre-wrap; flex-shrink:0; }
-  .spread { position:sticky; bottom:-14px; margin:auto -16px -14px; padding:10px 16px; background:var(--panel); border-top:1px solid var(--line); font-size:12px; display:grid; grid-template-columns:auto 1fr; column-gap:12px; align-items:center; }
+  .bottom { position:sticky; bottom:-14px; margin:auto -16px -14px; background:var(--panel); border-top:1px solid var(--line); }
+  .settings-row { padding:8px 16px; }
+  .spread { padding:10px 16px; border-bottom:1px solid var(--line); font-size:12px; display:grid; grid-template-columns:auto 1fr; column-gap:12px; align-items:center; }
   .spread .label { color:var(--muted); white-space:nowrap; }
   .spread .value { font:600 22px/1 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:nowrap; grid-row:span 2; }
   .spread .value.good { color:var(--ok); }
@@ -141,7 +143,6 @@
     </section>
     <section>
       <div class="actions">
-        <button id="inspect">Check devices</button>
         <button class="primary" id="calibrate">Calibrate</button>
         <button class="danger" id="stop">Stop</button>
       </div>
@@ -149,7 +150,6 @@
         <button class="primary" id="pointcloud" title="Merged point cloud of the selected stereo devices (needs a calibration)">Point cloud</button>
         <button class="primary" id="panorama" title="Calibrated panorama of one camera per device (needs a calibration)">Panorama</button>
         <button class="primary" id="detections" title="Merge detections from all selected cameras onto a calibrated panorama">Detections</button>
-        <select id="projection" title="Panorama projection surface"><option value="cylindrical">Cylindrical</option><option value="spherical">Spherical</option><option value="perspective">Perspective</option></select>
       </div>
       <label class="option" title="Tape-measured distances between camera lens centers. Required when no device uses a stereo pair, optional otherwise."><input type="checkbox" id="askDistances"> Enter measured distances</label>
     </section>
@@ -211,10 +211,13 @@
       <summary><h2>Log</h2></summary>
       <div class="log" id="log"></div>
     </details>
-    <div class="spread" id="spread" hidden>
-      <span class="value" id="spreadValue">–</span>
-      <span class="label">Frame timestamp spread</span>
-      <span class="note" id="spreadNote"></span>
+    <div class="bottom">
+      <div class="spread" id="spread" hidden>
+        <span class="value" id="spreadValue">–</span>
+        <span class="label">Frame timestamp spread</span>
+        <span class="note" id="spreadNote"></span>
+      </div>
+      <div class="settings-row"><button class="small" id="settings" title="Projection, image groups, PTP lock, depth model and range">⚙ Settings</button></div>
     </div>
   </aside>
   <div class="viewer">
@@ -242,6 +245,30 @@
       <button id="pwSkip">Continue without PTP</button>
       <button class="primary" id="pwSubmit">Set up PTP</button>
     </div>
+  </div>
+</div>
+<div class="modal-backdrop" id="settingsModal" hidden>
+  <div class="modal">
+    <h3>Settings</h3>
+    <p>Apply to the next job and are kept in <code>settings.json</code>. Options given explicitly on the command line keep precedence.</p>
+    <form id="settingsForm">
+      <fieldset class="filters">
+        <label>Panorama projection<select id="setProjection"><option value="cylindrical">Cylindrical</option><option value="spherical">Spherical</option><option value="perspective">Perspective</option></select></label>
+        <label>Image groups per calibration<input id="setSampleCount" type="number" min="1" max="100" step="1" required></label>
+        <label>Image groups per Capture frames<input id="setCaptureGroups" type="number" min="1" max="100" step="1" placeholder="Same as calibration"></label>
+        <label>Exposure warm-up (s)<input id="setWarmup" type="number" min="0" max="60" step="0.5" required></label>
+        <label>PTP lock: frame spread below (ms)<input id="setPtpSettleMs" type="number" min="0.1" max="100" step="0.1" required></label>
+        <label>PTP lock: give up after (s)<input id="setPtpTimeout" type="number" min="1" max="300" step="1" required></label>
+        <label>NeuralDepth model<select id="setModel"><option>LARGE</option><option>MEDIUM</option><option>SMALL</option></select></label>
+        <label>Depth size (W H)<input id="setSize" placeholder="Model size (768 480)" title="Smaller sizes let more devices stream point clouds over one link, e.g. 384 240 for four"></label>
+        <label>Depth range from (m)<input id="setMinRange" type="number" min="0" max="100" step="0.1" required></label>
+        <label>Depth range to (m)<input id="setMaxRange" type="number" min="0.1" max="1000" step="0.5" required></label>
+      </fieldset>
+      <div class="actions">
+        <button type="button" id="settingsCancel">Cancel</button>
+        <button class="primary" type="submit">Save</button>
+      </div>
+    </form>
   </div>
 </div>
 <div class="modal-backdrop" id="distModal" hidden>
@@ -423,7 +450,11 @@ function renderDevices(devices, calibrations) {
     cb.type = 'checkbox';
     cb.disabled = !d.selectable || busy;
     cb.checked = selected.has(d.name);
-    cb.onchange = () => { cb.checked ? selected.add(d.name) : selected.delete(d.name); render(state); };
+    cb.onchange = () => {
+      cb.checked ? selected.add(d.name) : selected.delete(d.name);
+      render(state);
+      if (cb.checked && state && !state.busy && !state.deviceInfo[d.name]) post('/api/inspect', { devices: [d.name] });
+    };
     label.appendChild(cb);
     label.appendChild(document.createTextNode(d.name));
     if (calibratedIds.has(d.deviceId)) { const c = document.createElement('span'); c.className = 'cal'; c.textContent = 'calibrated'; c.style.marginLeft = '6px'; c.title = 'part of a stored calibration'; label.appendChild(c); }
@@ -483,7 +514,6 @@ function updateButtons() {
   $('devCount').textContent = busy && state.jobDevices && state.jobDevices.length ? `· ${state.jobDevices.length} in use` : n ? `· ${n} selected${inspected ? `, ${inspected} checked` : ''}` : '';
   const covered = n >= 2 && hasCalibration(selectedDevices());
   const stereo = selectedDevices().every(d => !state.deviceInfo[d] || state.deviceInfo[d].stereoPair);
-  $('inspect').disabled = busy || n < 1;
   $('calibrate').disabled = busy || n < 2;
   $('capture').disabled = busy || n < 1;
   $('capturePointcloud').disabled = busy || !covered || !stereo;
@@ -497,7 +527,6 @@ function updateButtons() {
   $('detectionFields').disabled = !state.detectionsAvailable || (busy && !detecting);
   $('applyFilters').disabled = !detecting;
   $('detectionsRequirement').hidden = !!state.detectionsAvailable;
-  $('projection').disabled = busy;
   $('stop').disabled = !busy || state.phase === 'discovering';
   $('refresh').disabled = busy;
   const needDistances = n >= 2 && inspected === n && !scaleSource();
@@ -593,6 +622,8 @@ function render(s) {
 let panoStreaming = false;
 function renderLive(s) {
   const pc = s.phase === 'pointcloud', pano = s.phase === 'panorama', detections = s.phase === 'detections';
+  const settingsChanged = JSON.stringify(s.settings);
+  if (settingsChanged !== shownSettings) { shownSettings = settingsChanged; if (!$('settingsModal').hidden) fillSettings(s.settings); }
   const remote = pc || detections;
   const viewer = $('viewer');
   // The visualizer fetches topic groups on load, after this mode has registered its topics.
@@ -968,7 +999,6 @@ for (const fold of document.querySelectorAll('details.fold')) {
   fold.addEventListener('toggle', () => { try { localStorage.setItem('fold:' + fold.dataset.key, fold.open ? 'open' : 'closed'); } catch (e) {} });
 }
 $('refresh').onclick = () => post('/api/refresh');
-$('inspect').onclick = () => post('/api/inspect', { devices: selectedDevices() });
 $('calibrate').onclick = () => {
   const devices = selectedDevices();
   const chosen = {}; for (const d of devices) if (modes[d]) chosen[d] = modes[d];
@@ -984,10 +1014,10 @@ $('capture').onclick = () => {
 };
 $('capturePointcloud').onclick = () => { dismissedCapture = null; post('/api/capture/pointcloud', { devices: selectedDevices() }); };
 $('pointcloud').onclick = () => post('/api/pointcloud', { devices: selectedDevices() });
-$('panorama').onclick = () => post('/api/panorama', { devices: selectedDevices(), projection: $('projection').value });
+$('panorama').onclick = () => post('/api/panorama', { devices: selectedDevices() });
 $('detections').onclick = () => {
   const filters = detectionFilters();
-  if (filters) post('/api/detections', { devices: selectedDevices(), projection: $('projection').value, filters });
+  if (filters) post('/api/detections', { devices: selectedDevices(), filters });
 };
 $('detectionForm').onsubmit = event => {
   event.preventDefault();
@@ -995,6 +1025,28 @@ $('detectionForm').onsubmit = event => {
   if (filters) post('/api/detections/filters', { filters });
 };
 $('stop').onclick = () => post('/api/stop');
+
+// ------------------------------------------------------------------ settings dialog
+const SETTING_FIELDS = { projection: 'setProjection', sampleCount: 'setSampleCount', captureGroups: 'setCaptureGroups', warmupSeconds: 'setWarmup', ptpSettleMs: 'setPtpSettleMs', ptpSettleTimeout: 'setPtpTimeout', model: 'setModel', size: 'setSize', minRange: 'setMinRange', maxRange: 'setMaxRange' };
+let shownSettings = null;
+function fillSettings(settings) {
+  for (const [key, id] of Object.entries(SETTING_FIELDS)) {
+    const v = settings[key];
+    $(id).value = key === 'size' ? (v ? v.join(' ') : '') : (v == null ? '' : v);
+  }
+}
+$('settings').onclick = () => { if (state && state.settings) { fillSettings(state.settings); $('settingsModal').hidden = false; } };
+$('settingsCancel').onclick = () => { $('settingsModal').hidden = true; };
+$('settingsForm').onsubmit = async event => {
+  event.preventDefault();
+  const settings = {};
+  for (const [key, id] of Object.entries(SETTING_FIELDS)) settings[key] = $(id).value.trim();
+  const r = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings }) });
+  const data = await r.json();
+  if (!r.ok) { alert(data.error || 'Request failed'); return; }
+  $('settingsModal').hidden = true;
+  poll();
+};
 poll();
 setInterval(poll, 1000);
 </script>

@@ -2,11 +2,13 @@
 """Multi-device app: pick OAK 4 devices on the network, calibrate them against each other
 (dai.beta.node.MultiDeviceCalibration), then run a merged point cloud, calibrated panorama or detections.
 
-A single Python process serves a small control page (device list, Check devices, Calibrate, Stop).
-"Check devices" connects to every selected device and reads which cameras it has and whether its
-factory calibration contains a stereo pair. Devices with a stereo pair register both cameras (the
-pair fixes the metric scale); devices without one register a single camera, and when no device
-provides a stereo pair the page asks for measured camera-to-camera distances (setKnownDistance).
+A single Python process serves a small control page (device list, Calibrate, Stop, Settings).
+Ticking a device connects to it and reads which cameras it has and whether its factory calibration
+contains a stereo pair. Devices with a stereo pair register both cameras (the pair fixes the metric
+scale); devices without one register a single camera, and when no device provides a stereo pair the
+page asks for measured camera-to-camera distances (setKnownDistance). The Settings dialog changes the
+higher-level options (projection, image groups, PTP lock, depth model and range) at runtime; they
+are kept in settings.json, while options given explicitly on the command line take precedence.
 "Calibrate" streams the cameras into the node, shows live previews so the overlap can be checked,
 stores the result as JSON and renders the device coordinate systems in a 3D view together with the
 calibration metrics (data confidence, Sampson error, pairwise distances, change against the previous
@@ -31,6 +33,7 @@ import collections
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -132,6 +135,50 @@ while True:
 """.replace("RING", str(CAPTURE_RING))
 PTP_WARNING = "Devices are not PTP-synchronized: the calibration may be less precise."
 NO_SCALE_WARNING = "No device provides a stereo pair, so the metric scale must come from a measured distance between two cameras."
+SETTINGS_FILE = APP_DIR / "settings.json"  # the Settings dialog of the page; options given explicitly on the command line win
+# Page setting -> (argument it sets, kind, limits (low, high) or choices)
+SETTINGS = {
+    "projection": ("projection", "choice", list(PROJECTIONS)),
+    "sampleCount": ("sample_count", "int", (1, 100)),
+    "captureGroups": ("capture_groups", "optional_int", (1, 100)),
+    "warmupSeconds": ("warmup_seconds", "float", (0.0, 60.0)),
+    "ptpSettleMs": ("ptp_settle_ms", "float", (0.1, 100.0)),
+    "ptpSettleTimeout": ("ptp_settle_timeout", "float", (1.0, 300.0)),
+    "model": ("model", "choice", ["LARGE", "MEDIUM", "SMALL"]),
+    "size": ("size", "optional_size", (64, 8000)),
+    "minRange": ("min_range", "float", (0.0, 100.0)),
+    "maxRange": ("max_range", "float", (0.1, 1000.0)),
+}
+
+
+def coerce_setting(key, value):
+    """The validated value of a page setting (None for an empty optional one); raises ValueError with a page message."""
+    _, kind, limits = SETTINGS[key]
+    if kind == "choice":
+        if value not in limits:
+            raise ValueError(f"{key}: choose one of {', '.join(limits)}")
+        return value
+    if value in (None, ""):
+        if kind.startswith("optional"):
+            return None
+        raise ValueError(f"{key} is required")
+    if kind == "optional_size":
+        parts = value if isinstance(value, (list, tuple)) else re.split(r"[\s,x×]+", str(value).strip())
+        try:
+            width, height = (int(p) for p in parts)
+        except (TypeError, ValueError):
+            raise ValueError("size must be a width and a height, e.g. 640 400") from None
+        if not all(limits[0] <= v <= limits[1] for v in (width, height)):
+            raise ValueError(f"size must be between {limits[0]} and {limits[1]} pixels")
+        return [width, height]
+    try:
+        number = int(value) if kind in ("int", "optional_int") else float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a number") from None
+    low, high = limits
+    if not low <= number <= high:
+        raise ValueError(f"{key} must be between {low:g} and {high:g}")
+    return number
 
 
 def parse_args():
@@ -150,7 +197,9 @@ def parse_args():
     parser.add_argument("--pano-size", type=int, nargs=2, default=(640, 400), metavar=("W", "H"), help="Camera output size fed to the stitcher (default: 640 400)")
     parser.add_argument("--detections-model", default="luxonis/yolov6-nano:r2-coco-512x288", help="Model Zoo detection model, shared by all cameras (default: luxonis/yolov6-nano:r2-coco-512x288)")
     parser.add_argument("--seam", default="GRAPHCUT_COLOR", choices=["NONE", "VORONOI", "DP_COLOR", "DP_COLOR_GRAD", "GRAPHCUT_COLOR", "GRAPHCUT_COLOR_GRAD"], help="Panorama seam finder; NONE copies the inputs without blending (default: GRAPHCUT_COLOR)")
-    parser.add_argument("--sample-count", type=int, default=10, help="Synchronized image groups collected per calibration and saved per capture (default: 10)")
+    parser.add_argument("--sample-count", type=int, default=10, help="Synchronized image groups collected per calibration (default: 10)")
+    parser.add_argument("--capture-groups", type=int, default=None, help="Synchronized image groups saved per Capture frames (default: the same as --sample-count)")
+    parser.add_argument("--projection", default="cylindrical", choices=list(PROJECTIONS), help="Panorama projection surface (default: cylindrical)")
     parser.add_argument("--fps", type=float, default=CAMERA_FPS, help="Camera FPS while calibrating (default: 10)")
     parser.add_argument("--sync-threshold", type=float, default=1.0, help="Sync threshold of the calibration node in seconds; the scene is static, so this only has to catch one frame of every camera (default: 1)")
     parser.add_argument("-c", "--calibration", type=Path, nargs="*", default=[], help="Existing multi-device calibration JSON files to import (copied into calibrations/)")
@@ -158,7 +207,9 @@ def parse_args():
     parser.add_argument("--warmup-seconds", type=float, default=4.0, help="Seconds to stream before the node starts collecting, so auto exposure settles (default: 4)")
     parser.add_argument("--ptp-settle-ms", type=float, default=2.0, help="PTP counts as settled once 5 consecutive image groups of all devices lie within this many ms (default: 2)")
     parser.add_argument("--ptp-settle-timeout", type=float, default=20.0, help="Give up waiting for PTP to settle after this many seconds and calibrate anyway; the scene is static, so a few ms of spread do not matter (default: 20)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.cli_overrides = {name for name in vars(args) if getattr(args, name) != parser.get_default(name)}  # explicit options beat settings.json
+    return args
 
 
 def detection_config(settings, config=None):
@@ -428,7 +479,52 @@ class App:
         CAPTURE_DIR.mkdir(exist_ok=True)
         self._load_saved_calibrations()
         self.log(f"DepthAI {dai.__version__}")
+        self._load_settings()
         self.discover_async()
+
+    # ---------------------------------------------------------------- settings
+    def settings(self):
+        """The page settings as currently applied to the arguments every job reads."""
+        values = {key: getattr(self.args, arg) for key, (arg, _, _) in SETTINGS.items()}
+        return {key: (list(v) if isinstance(v, tuple) else v) for key, v in values.items()}
+
+    def _load_settings(self):
+        if not SETTINGS_FILE.is_file():
+            return
+        try:
+            saved = json.loads(SETTINGS_FILE.read_text())
+        except ValueError as e:
+            self.log(f"Ignoring {SETTINGS_FILE.name}: {e}")
+            return
+        overrides = getattr(self.args, "cli_overrides", set())
+        applied, skipped = [], []
+        for key, value in saved.items():
+            if key not in SETTINGS:
+                continue
+            if SETTINGS[key][0] in overrides:
+                skipped.append(key)
+                continue
+            try:
+                setattr(self.args, SETTINGS[key][0], coerce_setting(key, value))
+                applied.append(f"{key}={value}")
+            except ValueError as e:
+                self.log(f"Ignoring saved setting {key}: {e}")
+        if applied or skipped:
+            self.log(f"Settings from {SETTINGS_FILE.name}: {', '.join(applied) or 'none'}" + (f" (command line wins for {', '.join(skipped)})" if skipped else ""))
+
+    def update_settings(self, values):
+        """Validates and applies page settings to the arguments the next job reads, and saves them; raises ValueError."""
+        if not isinstance(values, dict):
+            raise ValueError("settings must be an object")
+        new = {key: coerce_setting(key, values[key]) for key in SETTINGS if key in values}
+        merged = {**self.settings(), **new}
+        if merged["minRange"] >= merged["maxRange"]:
+            raise ValueError("the minimum depth range must be below the maximum")
+        with self.lock:
+            for key, value in new.items():
+                setattr(self.args, SETTINGS[key][0], value)
+        SETTINGS_FILE.write_text(json.dumps(self.settings(), indent=1))
+        self.log("Settings: " + ", ".join(f"{key}={value}" for key, value in new.items()))
 
     # ---------------------------------------------------------------- state helpers
     def log(self, text):
@@ -477,6 +573,7 @@ class App:
                 "streaming": self.streaming,
                 "visualizerPort": self.args.http_port,
                 "detectionsAvailable": DETECTIONS_AVAILABLE,
+                "settings": self.settings(),
             }
 
     def preview_jpeg(self, name):
@@ -1101,20 +1198,21 @@ class App:
         return self._start_job(self._capture, device_names, modes)
 
     def _capture(self, device_names, modes):
-        """Saves --sample-count synchronized full-resolution image groups of the registered cameras (the stereo pair
+        """Saves --capture-groups (default --sample-count) synchronized full-resolution image groups of the registered cameras (the stereo pair
         or the chosen single camera of each device, as for the calibration) once the exposure and, with PTP, the frame
         lock have settled: the same material the calibration consumes, so the setup can be calibrated offline. Every
         group goes to captures/<timestamp>/group_NN/ as PNG; capture.json holds the timestamps and spreads and the
         factory calibration of every device is saved next to it."""
         args = self.args
-        self.set_state("capturing", "Checking the devices...", progress={"stage": "inspecting", "done": 0, "total": args.sample_count, "percent": None}, stats=None)
-        self.log(f"Capture of {device_names} started ({args.sample_count} groups)")
+        sample_count = args.capture_groups or args.sample_count
+        self.set_state("capturing", "Checking the devices...", progress={"stage": "inspecting", "done": 0, "total": sample_count, "percent": None}, stats=None)
+        self.log(f"Capture of {device_names} started ({sample_count} groups)")
         self._inspect(device_names)
         self.set_state("capturing")
         registered = {name: self._cameras_for_mode(self.device_info[name], modes.get(name))[0] for name in device_names}
         for name in device_names:
             self.log(f"{name}: capturing {' + '.join(registered[name])}")
-        self.set_state(progress={"stage": "ptp", "done": 0, "total": args.sample_count, "percent": None})
+        self.set_state(progress={"stage": "ptp", "done": 0, "total": sample_count, "percent": None})
         if len(device_names) > 1:
             ptp = self._prepare_ptp(device_names)
         else:
@@ -1123,7 +1221,7 @@ class App:
         if self.stop_event.is_set():
             self.set_state("idle", "Capture stopped.", progress=None)
             return
-        self.set_state("capturing", "Connecting to devices...", progress={"stage": "connecting", "done": 0, "total": args.sample_count, "percent": None})
+        self.set_state("capturing", "Connecting to devices...", progress={"stage": "connecting", "done": 0, "total": sample_count, "percent": None})
         captured_groups = []  # [{"spreadMs": float, "frames": [frame dicts]}] in capture order
         device_ids = {}
         calibrations = {}  # device name -> factory CalibrationHandler, saved with the frames
@@ -1165,12 +1263,12 @@ class App:
             group_queue = sync.out.createOutputQueue(maxSize=8, blocking=False)
             pipeline.start()
             try:
-                groups = self._wait_for_lock(pipeline, group_queue, ptp, args.sample_count, "Capturing")
+                groups = self._wait_for_lock(pipeline, group_queue, ptp, sample_count, "Capturing")
                 order = [(name, socket_str) for name, socket_str, *_ in streams]
-                while len(captured_groups) < args.sample_count:
+                while len(captured_groups) < sample_count:
                     done = len(captured_groups)
-                    self.set_state(message=f"Capturing synchronized image group {done + 1} of {args.sample_count}. Keep the devices still and looking at the same textured scene.",
-                                   progress={"stage": "capturing", "done": done, "total": args.sample_count, "percent": int(100 * done / args.sample_count), "detail": f"{done} of {args.sample_count} image groups received"})
+                    self.set_state(message=f"Capturing synchronized image group {done + 1} of {sample_count}. Keep the devices still and looking at the same textured scene.",
+                                   progress={"stage": "capturing", "done": done, "total": sample_count, "percent": int(100 * done / sample_count), "detail": f"{done} of {sample_count} image groups received"})
                     # A fresh group after the previous transfer, so its frames are still in the rings on the devices
                     group_queue.tryGetAll()
                     group = None
@@ -1215,7 +1313,7 @@ class App:
                                 "timestamp_s": seconds(message.getTimestamp()), "timestampDevice_s": seconds(message.getTimestampDevice()), "timestampSystem_s": seconds(message.getTimestampSystem()),
                             })
                             del pending[key]
-                            self.set_state(progress={"stage": "capturing", "done": done, "total": args.sample_count, "percent": int(100 * (done + len(frames) / len(streams)) / args.sample_count),
+                            self.set_state(progress={"stage": "capturing", "done": done, "total": sample_count, "percent": int(100 * (done + len(frames) / len(streams)) / sample_count),
                                                      "detail": f"group {done + 1}: {len(frames)} of {len(streams)} full-resolution frames received"})
                         time.sleep(0.02)
                     if self.stop_event.is_set():
@@ -1235,7 +1333,7 @@ class App:
             self.set_state("idle", "Capture stopped.", progress=None)
             return
 
-        self.set_state(message="Saving the frames...", progress={"stage": "saving", "done": len(captured_groups), "total": args.sample_count, "percent": None})
+        self.set_state(message="Saving the frames...", progress={"stage": "saving", "done": len(captured_groups), "total": sample_count, "percent": None})
         now = time.time()
         folder = CAPTURE_DIR / time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
         folder.mkdir(parents=True, exist_ok=True)
@@ -1266,7 +1364,7 @@ class App:
         spread_max = max(g["spreadMs"] for g in saved_groups)
         info = {
             "kind": "frames", "dir": folder.name, "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), "fps": args.fps,
-            "sampleCount": args.sample_count, "spreadMaxMs": round(spread_max, 3), "ptp": ptp_summary,
+            "sampleCount": sample_count, "spreadMaxMs": round(spread_max, 3), "ptp": ptp_summary,
             "devices": [{"name": name, "deviceId": device_ids[name], "product": self.device_info[name]["productName"], "sockets": registered[name],
                          "stereoPair": self.device_info[name]["stereoPair"] if len(registered[name]) == 2 else None, "calibrationFile": calibration_files.get(name)} for name in device_names],
             "groups": saved_groups,
@@ -1695,6 +1793,7 @@ class App:
 
     # ---------------------------------------------------------------- panorama
     def panorama_async(self, device_names, projection, filters=None):
+        projection = projection if projection in PROJECTIONS else getattr(getattr(self, "args", None), "projection", "cylindrical")  # Settings
         if filters is not None:
             if not DETECTIONS_AVAILABLE:
                 raise ValueError("Detections requires an updated DepthAI wheel with ImgDetectionsFilter and Stitching source masks. See USAGE.md.")
@@ -1713,7 +1812,7 @@ class App:
         detections = filters is not None
         mode = "detections" if detections else "panorama"
         title = "Detections" if detections else "Panorama"
-        projection = projection if projection in PROJECTIONS else "cylindrical"
+        projection = projection if projection in PROJECTIONS else getattr(args, "projection", "cylindrical")
         self.set_state(mode, "Checking the devices...", progress=None, stats=None)
         self.log(f"{title} of {device_names} started ({projection}, {args.pano_size[0]}x{args.pano_size[1]} at {args.pano_fps:g} FPS)")
         _, calibration = self._require_calibration(device_names)
@@ -2016,12 +2115,18 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Detection filters must be an object")
                 if len(set(devices)) != len(devices):
                     raise ValueError("Select distinct devices")
-                ok = self.app.panorama_async(devices, body.get("projection") or "cylindrical", filters)
+                ok = self.app.panorama_async(devices, body.get("projection"), filters)  # None: the projection from Settings
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
         elif self.path == "/api/detections/filters":
             try:
                 self.app.update_detection_filters(body.get("filters", {}))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            ok = True
+        elif self.path == "/api/settings":
+            try:
+                self.app.update_settings(body.get("settings", {}))
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
             ok = True

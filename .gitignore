@@ -222,3 +222,6 @@ __marimo__/
 # Captured frames (Capture button); keep the folder
 captures/*
 !captures/.gitkeep
+
+# Settings dialog of the page
+settings.json

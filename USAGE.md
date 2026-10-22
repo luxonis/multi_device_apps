@@ -37,9 +37,9 @@ the existing modes remain available and the Detections button is disabled.
 
 Open **http://localhost:8093** in a browser.
 
-1. **Devices**: every reachable device is listed; free OAK 4 devices can be ticked. Refresh rescans.
-2. **Check devices** (optional) reads the cameras of the ticked devices. Under each device choose what the
-   calibration uses: its stereo pair (default, fixes the metric scale) or one camera.
+1. **Devices**: every reachable device is listed; free OAK 4 devices can be ticked. Refresh rescans. Ticking a
+   device reads its cameras; under it choose what the calibration uses: its stereo pair (default, fixes the metric
+   scale) or one camera.
 3. **Calibrate**: point all cameras at the same static, well textured scene with plenty of overlap and keep
    the devices still. If no device uses a stereo pair you are asked for the tape-measured distance between
    two camera lenses (tick *Enter measured distances* to add such measurements in any case). The live
@@ -49,7 +49,7 @@ Open **http://localhost:8093** in a browser.
 4. **Point cloud** (devices with stereo pairs): NeuralDepth on every device, merged into one cloud in the
    calibration origin and shown in the DepthAI visualizer.
 5. **Panorama**: one camera per device stitched from the calibration onto a cylinder (default), a sphere or a
-   plane, chosen next to the button.
+   plane, chosen in **Settings**.
 6. **Detections**: runs the same detector on one calibrated camera per device, then maps their boxes into
    the panorama with the native host `ImgDetectionsFilter`. Works with stereo and single-camera devices;
    no depth is needed. The embedded visualizer shows source camera groups plus a **Detections** group.
@@ -77,7 +77,7 @@ One **Apply filters** updates every view. Cross-camera overlap merging applies t
 overlays retain their own camera coordinates and show the filtered detections visible to that camera.
 All cameras use `--detections-model` (default `luxonis/yolov6-nano:r2-coco-512x288`), resolved for each
 device platform. The first run needs internet for the model download. Detection mode uses `--pano-fps`,
-`--pano-size`, `--seam`, and the projection selector; its panorama is capped at 2560×1440.
+`--pano-size`, `--seam`, and the projection from **Settings**; its panorama is capped at 2560×1440.
 
 Remapping uses camera rotation and intrinsics without depth or camera translation. Nearby objects can
 retain parallax errors; evaluate merging with more distant objects and overlapping views. Boxes crossing
@@ -114,6 +114,19 @@ frames on the device and only the chosen frame crosses the network. Only small p
 previews stream while waiting. With a single device no PTP is involved.
 
 **Stop** ends the running mode. Recalibrate whenever a device is moved.
+
+### Settings
+
+**⚙ Settings** at the bottom left opens the higher-level options; they apply to the next job and are kept in
+`settings.json` next to the app, so they survive a restart. An option given explicitly on the command line
+(for example `./run.sh --sample-count 20`) keeps precedence over the saved value for that run.
+
+- **Panorama projection**: cylindrical, spherical or perspective (`--projection`).
+- **Image groups per calibration** (`--sample-count`) and **per Capture frames** (`--capture-groups`, blank means the
+  same as the calibration).
+- **Exposure warm-up**, **PTP lock** threshold and timeout (`--warmup-seconds`, `--ptp-settle-ms`, `--ptp-settle-timeout`).
+- **NeuralDepth model**, **depth size** (blank for the model size; smaller sizes let more devices stream point clouds
+  over one link) and **depth range** (`--model`, `--size`, `--min-range`, `--max-range`).
 
 ### PTP time sync
 
