@@ -107,7 +107,7 @@ def parse_args():
     parser.add_argument("--pano-size", type=int, nargs=2, default=(640, 400), metavar=("W", "H"), help="Camera output size fed to the stitcher (default: 640 400)")
     parser.add_argument("--detections-model", default="luxonis/yolov6-nano:r2-coco-512x288", help="Model Zoo detection model, shared by all cameras (default: luxonis/yolov6-nano:r2-coco-512x288)")
     parser.add_argument("--seam", default="GRAPHCUT_COLOR", choices=["NONE", "VORONOI", "DP_COLOR", "DP_COLOR_GRAD", "GRAPHCUT_COLOR", "GRAPHCUT_COLOR_GRAD"], help="Panorama seam finder; NONE copies the inputs without blending (default: GRAPHCUT_COLOR)")
-    parser.add_argument("--sample-count", type=int, default=10, help="Synchronized image groups collected per calibration (default: 10)")
+    parser.add_argument("--sample-count", type=int, default=10, help="Synchronized image groups collected per calibration and saved per capture (default: 10)")
     parser.add_argument("--fps", type=float, default=CAMERA_FPS, help="Camera FPS while calibrating (default: 10)")
     parser.add_argument("--sync-threshold", type=float, default=1.0, help="Sync threshold of the calibration node in seconds; the scene is static, so this only has to catch one frame of every camera (default: 1)")
     parser.add_argument("-c", "--calibration", type=Path, nargs="*", default=[], help="Existing multi-device calibration JSON files to import (copied into calibrations/)")
@@ -1033,18 +1033,20 @@ class App:
         return self._start_job(self._capture, device_names, modes)
 
     def _capture(self, device_names, modes):
-        """Saves one synchronized full-resolution frame of every registered camera (the stereo pair or the chosen
-        single camera of each device, as for the calibration) once the exposure and, with PTP, the frame lock have
-        settled. The frames go to captures/<timestamp>/ as PNG with the timestamps and the spread in capture.json."""
+        """Saves --sample-count synchronized full-resolution image groups of the registered cameras (the stereo pair
+        or the chosen single camera of each device, as for the calibration) once the exposure and, with PTP, the frame
+        lock have settled: the same material the calibration consumes, so the setup can be calibrated offline. Every
+        group goes to captures/<timestamp>/group_NN/ as PNG; capture.json holds the timestamps and spreads and the
+        factory calibration of every device is saved next to it."""
         args = self.args
-        self.set_state("capturing", "Checking the devices...", progress={"stage": "inspecting", "done": 0, "total": 1, "percent": None}, stats=None)
-        self.log(f"Capture of {device_names} started")
+        self.set_state("capturing", "Checking the devices...", progress={"stage": "inspecting", "done": 0, "total": args.sample_count, "percent": None}, stats=None)
+        self.log(f"Capture of {device_names} started ({args.sample_count} groups)")
         self._inspect(device_names)
         self.set_state("capturing")
         registered = {name: self._cameras_for_mode(self.device_info[name], modes.get(name))[0] for name in device_names}
         for name in device_names:
             self.log(f"{name}: capturing {' + '.join(registered[name])}")
-        self.set_state(progress={"stage": "ptp", "done": 0, "total": 1, "percent": None})
+        self.set_state(progress={"stage": "ptp", "done": 0, "total": args.sample_count, "percent": None})
         if len(device_names) > 1:
             ptp = self._prepare_ptp(device_names)
         else:
@@ -1053,10 +1055,10 @@ class App:
         if self.stop_event.is_set():
             self.set_state("idle", "Capture stopped.", progress=None)
             return
-        self.set_state("capturing", "Connecting to devices...", progress={"stage": "connecting", "done": 0, "total": 1, "percent": None})
-        captured = []
+        self.set_state("capturing", "Connecting to devices...", progress={"stage": "connecting", "done": 0, "total": args.sample_count, "percent": None})
+        captured_groups = []  # [{"spreadMs": float, "frames": [frame dicts]}] in capture order
         device_ids = {}
-        spread_ms = None
+        calibrations = {}  # device name -> factory CalibrationHandler, saved with the frames
         with dai.Pipeline(createImplicitDevice=False) as pipeline:
             pipeline.setAutoCalibrationMode(dai.Pipeline.AutoCalibrationMode.OFF)
             # One group = the ticks of every camera from the same capture slot. The threshold is just under a frame
@@ -1071,6 +1073,7 @@ class App:
             for name in device_names:
                 device = pipeline.addDevice(dai.DeviceInfo(name))
                 device_ids[name] = device.getDeviceId()
+                calibrations[name] = device.readCalibration()
                 for socket_str in registered[name]:
                     camera = pipeline.create(dai.node.Camera, device).build(socket_from_name(socket_str), sensorFps=args.fps)
                     camera.setOutputsNumFramesPool(2 * CAPTURE_RING)  # the ring holds CAPTURE_RING of them; the default pool stalls the camera
@@ -1094,100 +1097,122 @@ class App:
             group_queue = sync.out.createOutputQueue(maxSize=8, blocking=False)
             pipeline.start()
             try:
-                groups = self._wait_for_lock(pipeline, group_queue, ptp, 1, "Capturing")
-                self.set_state(message="Capturing one synchronized frame of every camera...", progress={"stage": "capturing", "done": 0, "total": 1, "percent": None})
-                group_queue.tryGetAll()  # only a group captured after the lock counts
-                group = None
-                deadline = time.monotonic() + max(5.0, 5 * 1000.0 / args.fps)
-                while pipeline.isRunning() and not self.stop_event.is_set() and time.monotonic() < deadline:
-                    group = group_queue.tryGet()
-                    if group is not None:
-                        break
-                    time.sleep(0.02)
-                if self.stop_event.is_set():
-                    raise InterruptedError
-                if group is None:
-                    raise RuntimeError("No synchronized frame group arrived: the cameras are not delivering frames in step.")
-                spread_ms = group.getIntervalNs() / 1e6
-                self.set_ptp(spreadMs=round(spread_ms, 2), spreadAt=time.monotonic(), groups=groups + 1)
-                # Ask every camera's ring for the full-resolution frame with the sequence number of its tick in the group
-                wanted = {}
-                for name, socket_str, key, request_queue, _ in streams:
-                    wanted[key] = group[key].getSequenceNum()
-                    request = dai.Buffer()
-                    request.setData(list(str(wanted[key]).encode()))
-                    request_queue.send(request)
-                self.log(f"Synchronized group with a spread of {spread_ms:.2f} ms; fetching the full-resolution frames " + ", ".join(f"{key} #{seq}" for key, seq in wanted.items()))
-                pending = {key: (name, socket_str, frame_queue) for name, socket_str, key, _, frame_queue in streams}
-                deadline = time.monotonic() + 30.0  # full frames of all cameras over a 100 Mbit link
-                while pending and pipeline.isRunning() and not self.stop_event.is_set() and time.monotonic() < deadline:
-                    for key in list(pending):
-                        name, socket_str, frame_queue = pending[key]
-                        message = frame_queue.tryGet()
-                        if message is None:
-                            continue
-                        if not isinstance(message, dai.ImgFrame):
-                            raise RuntimeError(f"{key}: frame #{wanted[key]} was no longer buffered on the device when the request arrived; try again.")
-                        if message.getSequenceNum() != wanted[key]:
-                            self.log(f"{key}: ignoring frame #{message.getSequenceNum()}, waiting for #{wanted[key]}")
-                            continue
-                        captured.append({
-                            "device": name, "deviceId": device_ids[name], "socket": socket_str, "image": message.getCvFrame(),
-                            "width": message.getWidth(), "height": message.getHeight(), "type": str(message.getType()).split(".")[-1], "sequenceNum": message.getSequenceNum(),
-                            "timestamp_s": seconds(message.getTimestamp()), "timestampDevice_s": seconds(message.getTimestampDevice()), "timestampSystem_s": seconds(message.getTimestampSystem()),
-                        })
-                        del pending[key]
-                        self.set_state(progress={"stage": "capturing", "done": len(captured), "total": len(streams), "percent": int(100 * len(captured) / len(streams)),
-                                                 "detail": f"{len(captured)} of {len(streams)} full-resolution frames received"})
-                    time.sleep(0.02)
-                if self.stop_event.is_set():
-                    raise InterruptedError
-                if pending:
-                    raise RuntimeError(f"Full-resolution frames of {', '.join(pending)} did not arrive within 30 s.")
+                groups = self._wait_for_lock(pipeline, group_queue, ptp, args.sample_count, "Capturing")
+                order = [(name, socket_str) for name, socket_str, *_ in streams]
+                while len(captured_groups) < args.sample_count:
+                    done = len(captured_groups)
+                    self.set_state(message=f"Capturing synchronized image group {done + 1} of {args.sample_count}. Keep the devices still and looking at the same textured scene.",
+                                   progress={"stage": "capturing", "done": done, "total": args.sample_count, "percent": int(100 * done / args.sample_count), "detail": f"{done} of {args.sample_count} image groups received"})
+                    # A fresh group after the previous transfer, so its frames are still in the rings on the devices
+                    group_queue.tryGetAll()
+                    group = None
+                    deadline = time.monotonic() + max(5.0, 5 * 1000.0 / args.fps)
+                    while pipeline.isRunning() and not self.stop_event.is_set() and time.monotonic() < deadline:
+                        group = group_queue.tryGet()
+                        if group is not None:
+                            break
+                        time.sleep(0.02)
+                    if self.stop_event.is_set():
+                        raise InterruptedError
+                    if group is None:
+                        raise RuntimeError("No synchronized frame group arrived: the cameras are not delivering frames in step.")
+                    spread_ms = group.getIntervalNs() / 1e6
+                    groups += 1
+                    self.set_ptp(spreadMs=round(spread_ms, 2), spreadAt=time.monotonic(), groups=groups)
+                    # Ask every camera's ring for the full-resolution frame with the sequence number of its tick in the group
+                    wanted = {}
+                    for name, socket_str, key, request_queue, _ in streams:
+                        wanted[key] = group[key].getSequenceNum()
+                        request = dai.Buffer()
+                        request.setData(list(str(wanted[key]).encode()))
+                        request_queue.send(request)
+                    self.log(f"Group {done + 1}: spread {spread_ms:.2f} ms; fetching " + ", ".join(f"{key} #{seq}" for key, seq in wanted.items()))
+                    frames = []
+                    pending = {key: (name, socket_str, frame_queue) for name, socket_str, key, _, frame_queue in streams}
+                    deadline = time.monotonic() + 30.0  # full frames of all cameras over a 100 Mbit link
+                    while pending and pipeline.isRunning() and not self.stop_event.is_set() and time.monotonic() < deadline:
+                        for key in list(pending):
+                            name, socket_str, frame_queue = pending[key]
+                            message = frame_queue.tryGet()
+                            if message is None:
+                                continue
+                            if not isinstance(message, dai.ImgFrame):
+                                raise RuntimeError(f"{key}: frame #{wanted[key]} was no longer buffered on the device when the request arrived; try again.")
+                            if message.getSequenceNum() != wanted[key]:
+                                self.log(f"{key}: ignoring frame #{message.getSequenceNum()}, waiting for #{wanted[key]}")
+                                continue
+                            frames.append({
+                                "device": name, "deviceId": device_ids[name], "socket": socket_str, "image": message.getCvFrame(),
+                                "width": message.getWidth(), "height": message.getHeight(), "type": str(message.getType()).split(".")[-1], "sequenceNum": message.getSequenceNum(),
+                                "timestamp_s": seconds(message.getTimestamp()), "timestampDevice_s": seconds(message.getTimestampDevice()), "timestampSystem_s": seconds(message.getTimestampSystem()),
+                            })
+                            del pending[key]
+                            self.set_state(progress={"stage": "capturing", "done": done, "total": args.sample_count, "percent": int(100 * (done + len(frames) / len(streams)) / args.sample_count),
+                                                     "detail": f"group {done + 1}: {len(frames)} of {len(streams)} full-resolution frames received"})
+                        time.sleep(0.02)
+                    if self.stop_event.is_set():
+                        raise InterruptedError
+                    if pending:
+                        raise RuntimeError(f"Full-resolution frames of {', '.join(pending)} did not arrive within 30 s.")
+                    frames.sort(key=lambda c: order.index((c["device"], c["socket"])))  # device order, not arrival order
+                    captured_groups.append({"spreadMs": spread_ms, "frames": frames})
             except InterruptedError:
-                captured = []
+                captured_groups = []
             finally:
                 with self.lock:
                     self.previews = {}
                 pipeline.stop()
-        if not captured:
+        if not captured_groups:
             self.log("Capture stopped")
             self.set_state("idle", "Capture stopped.", progress=None)
             return
 
-        self.set_state(message="Saving the frames...", progress={"stage": "saving", "done": 0, "total": 1, "percent": None})
-        order = [(name, socket_str) for name, socket_str, *_ in streams]
-        captured.sort(key=lambda c: order.index((c["device"], c["socket"])))  # device order, not arrival order
+        self.set_state(message="Saving the frames...", progress={"stage": "saving", "done": len(captured_groups), "total": args.sample_count, "percent": None})
         now = time.time()
         folder = CAPTURE_DIR / time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
         folder.mkdir(parents=True, exist_ok=True)
         source = "timestampSystem_s" if ptp else "timestamp_s"  # the clock the Sync grouped by
-        first = min(c[source] for c in captured)
         thumbs = {}
-        frames = []
-        for c in captured:
-            file = f"{c['device']}_{c['socket']}.png".replace("/", "_").replace(" ", "_")
-            if not cv2.imwrite(str(folder / file), c["image"]):
-                raise RuntimeError(f"Failed to write {folder / file}")
-            thumbs[file] = self._thumbnail(c["image"])
-            frames.append({**{k: v for k, v in c.items() if k != "image"}, "file": file, "offsetMs": round((c[source] - first) * 1000.0, 3)})
+        saved_groups = []
+        for index, group in enumerate(captured_groups, 1):
+            group_dir = folder / f"group_{index:02d}"
+            group_dir.mkdir(exist_ok=True)
+            first = min(c[source] for c in group["frames"])
+            entries = []
+            for c in group["frames"]:
+                file = f"{group_dir.name}/{c['device']}_{c['socket']}.png".replace(" ", "_")
+                if not cv2.imwrite(str(folder / file), c["image"]):
+                    raise RuntimeError(f"Failed to write {folder / file}")
+                thumbs[file] = self._thumbnail(c["image"])
+                entries.append({**{k: v for k, v in c.items() if k != "image"}, "file": file, "offsetMs": round((c[source] - first) * 1000.0, 3)})
+            saved_groups.append({"index": index, "dir": group_dir.name, "spreadMs": round(group["spreadMs"], 3), "frames": entries})
+        calibration_files = {}
+        for name, handler in calibrations.items():
+            file = f"calibration_{device_ids[name]}.json"
+            if not handler.eepromToJsonFile(str(folder / file)):
+                self.log(f"WARNING: could not save the factory calibration of {name}")
+                continue
+            calibration_files[name] = file
         with self.lock:
             ptp_summary = {"active": self.ptp["active"], "settled": self.ptp["settled"], "master": self.ptp["master"], "warning": self.ptp["warning"]}
+        spread_max = max(g["spreadMs"] for g in saved_groups)
         info = {
-            "dir": folder.name, "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), "fps": args.fps, "spreadMs": round(spread_ms, 3),
-            "ptp": ptp_summary,
-            "devices": [{"name": name, "deviceId": device_ids[name], "product": self.device_info[name]["productName"], "sockets": registered[name]} for name in device_names],
-            "frames": frames,
+            "dir": folder.name, "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), "fps": args.fps,
+            "sampleCount": args.sample_count, "spreadMaxMs": round(spread_max, 3), "ptp": ptp_summary,
+            "devices": [{"name": name, "deviceId": device_ids[name], "product": self.device_info[name]["productName"], "sockets": registered[name],
+                         "stereoPair": self.device_info[name]["stereoPair"] if len(registered[name]) == 2 else None, "calibrationFile": calibration_files.get(name)} for name in device_names],
+            "groups": saved_groups,
         }
         (folder / "capture.json").write_text(json.dumps(info, indent=1))
         with self.lock:
             self.latest_capture = info
             self.capture_thumbs = {f"{folder.name}/{file}": jpeg for file, jpeg in thumbs.items() if jpeg is not None}
-        for f in frames:
-            self.log(f"{f['device']} {f['socket']}: {f['width']}x{f['height']} {f['type']}, seq {f['sequenceNum']}, {f['offsetMs']:+.2f} ms -> {f['file']}")
+        for g in saved_groups:
+            self.log(f"{g['dir']}: spread {g['spreadMs']:.2f} ms, " + ", ".join(f"{f['device']} {f['socket']} #{f['sequenceNum']} {f['offsetMs']:+.2f} ms" for f in g["frames"]))
+        frames_total = sum(len(g["frames"]) for g in saved_groups)
         sync_label = "PTP locked" if ptp_summary["settled"] else "PTP not settled" if ptp else "no PTP"
-        self.log(f"Captured {len(frames)} frames with a timestamp spread of {spread_ms:.2f} ms ({sync_label}) into captures/{folder.name}")
-        self.set_state("idle", f"Captured {len(frames)} frames ({spread_ms:.2f} ms spread, {sync_label}) into captures/{folder.name}.", progress=None)
+        self.log(f"Captured {len(saved_groups)} groups ({frames_total} frames, spread up to {spread_max:.2f} ms, {sync_label}) and {len(calibration_files)} device calibrations into captures/{folder.name}")
+        self.set_state("idle", f"Captured {len(saved_groups)} image groups ({frames_total} frames, spread up to {spread_max:.2f} ms, {sync_label}) into captures/{folder.name}.", progress=None)
 
     @staticmethod
     def _thumbnail(image, width=640):

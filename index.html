@@ -123,7 +123,8 @@
   .previews img { width:100%; height:100%; object-fit:contain; display:block; }
   .previews figcaption { position:absolute; left:0; bottom:0; padding:3px 8px; font-size:12px; color:#fff; background:rgba(0,0,0,.55); border-top-right-radius:6px; }
   .previews .title { grid-column:1 / -1; color:#d6dde6; font-size:13px; }
-  .previews .title button { margin-left:10px; vertical-align:middle; }
+  .previews .title button, .previews .title select { margin-left:8px; vertical-align:middle; font-size:12px; }
+  .previews .title select { padding:2px 4px; border-radius:4px; border:1px solid var(--line); background:var(--panel); color:var(--text); }
   .previews figure a { display:block; width:100%; height:100%; }
   @media (max-width: 900px) { main { grid-template-columns:1fr; grid-template-rows:auto 60vh; } aside { border-right:0; border-bottom:1px solid var(--line); } }
 </style>
@@ -142,7 +143,6 @@
       <div class="actions">
         <button id="inspect">Check devices</button>
         <button class="primary" id="calibrate">Calibrate</button>
-        <button id="capture" title="Save one synchronized full-resolution frame of every selected camera into captures/ (with PTP, after the frames have locked)">Capture</button>
         <button class="danger" id="stop">Stop</button>
       </div>
       <div class="actions" style="margin-top:8px">
@@ -169,6 +169,11 @@
       </form>
       <p style="font-size:12px;color:var(--muted);margin-bottom:0">Filters apply to the panorama and each source view. Label IDs are comma separated. Off keeps duplicates; NMS chooses one; Average merges them across cameras in the panorama.</p>
       <p id="detectionsRequirement" style="font-size:12px;color:var(--warn)" hidden>Install the updated DepthAI wheel for Detections; see USAGE.md.</p>
+    </details>
+    <details class="fold" data-key="extras">
+      <summary><h2>Extras</h2></summary>
+      <p style="font-size:12.5px;color:var(--muted);margin:6px 0 8px">Saves the calibration material to disk: the same number of synchronized full-resolution image groups the calibration collects, from the cameras chosen under each device, plus the factory calibration of every device. With PTP it waits for the frame lock first. Written to <code>captures/</code>.</p>
+      <button id="capture" title="Save synchronized image groups of the selected cameras into captures/ for an offline calibration">Capture frames</button>
     </details>
     <section>
       <div class="status-card" id="statusCard">
@@ -298,31 +303,44 @@ function refreshPreviews() {
 // ------------------------------------------------------------------ result of the last capture
 let renderedCapture = '';
 let dismissedCapture = null;
+let shownGroup = 1;
 function renderCapture(s) {
   const box = $('captureView');
   const c = s.latestCapture;
   const show = !!c && s.lastJob === 'capture' && !s.busy && dismissedCapture !== c.dir;
   box.hidden = !show;
   if (!show) { renderedCapture = ''; return false; }
-  if (renderedCapture === c.dir) return true;
-  renderedCapture = c.dir;
+  const group = c.groups.find(g => g.index === shownGroup) || c.groups[0];
+  const key = `${c.dir}:${group.index}`;
+  if (renderedCapture === key) return true;
+  renderedCapture = key;
   box.innerHTML = '';
-  const cols = Math.ceil(Math.sqrt(c.frames.length * 1.2));
+  const cols = Math.ceil(Math.sqrt(group.frames.length * 1.2));
   box.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
   const title = document.createElement('div');
   title.className = 'title';
   const sync = c.ptp && c.ptp.active ? (c.ptp.settled ? 'PTP locked' : 'PTP not settled') : 'no PTP';
-  title.textContent = `Capture ${c.time}: ${c.frames.length} frames, timestamp spread ${c.spreadMs.toFixed(2)} ms (${sync}), saved in captures/${c.dir}. Click a frame for the full-resolution PNG.`;
+  title.textContent = `Capture ${c.time}: ${c.groups.length} image groups of ${group.frames.length} frames, spread up to ${c.spreadMaxMs.toFixed(2)} ms (${sync}), saved in captures/${c.dir}. Click a frame for the full-resolution PNG. Group`;
+  const select = document.createElement('select');
+  for (const g of c.groups) {
+    const option = document.createElement('option');
+    option.value = g.index;
+    option.textContent = `${g.index} (${g.spreadMs.toFixed(2)} ms)`;
+    select.appendChild(option);
+  }
+  select.value = group.index;
+  select.onchange = () => { shownGroup = Number(select.value); render(state); };
+  title.appendChild(select);
   const close = document.createElement('button');
   close.className = 'small';
   close.textContent = 'Close';
   close.onclick = () => { dismissedCapture = c.dir; render(state); };
   title.appendChild(close);
   box.appendChild(title);
-  for (const f of c.frames) {
+  for (const f of group.frames) {
     const fig = document.createElement('figure');
     const link = document.createElement('a');
-    link.href = `/api/capture/${encodeURIComponent(c.dir)}/${encodeURIComponent(f.file)}`;
+    link.href = `/api/capture/${encodeURIComponent(c.dir)}/${f.file.split('/').map(encodeURIComponent).join('/')}`;
     link.target = '_blank';
     const img = document.createElement('img');
     img.src = link.href + '?thumb';
@@ -616,7 +634,7 @@ function renderGuide(s, shown, captureShown) {
   } else if (s.phase === 'error' && s.lastJob === 'calibrate') {
     html = `<h3>Calibration failed</h3><p style="color:var(--err)">${s.message}</p><ol><li>All cameras must see <b>the same part of the scene</b> (overlap of 25 % or more).</li><li>The scene must be <b>textured and lit</b>, not a blank wall.</li><li>Keep the devices still.</li></ol>`;
   } else {
-    html = `<h3>Get started</h3><ol><li>Tick two or more devices.</li><li>Point them at the same static, textured scene and keep them still.</li><li>Press <b>Calibrate</b>.</li><li>Then <b>Point cloud</b> (stereo devices), <b>Panorama</b> or <b>Detections</b>.</li></ol><p style="margin-top:10px;font-size:13px"><b>Capture</b> saves one synchronized full-resolution frame of every selected camera into <code>captures/</code>, waiting for the PTP frame lock first.</p><p style="margin-top:10px;font-size:13px">Devices with a stereo pair use it for the metric scale; otherwise you are asked for a measured camera distance.</p>` + (s.phase === 'error' ? `<p style="margin-top:10px;color:var(--err)">${s.message}</p>` : '');
+    html = `<h3>Get started</h3><ol><li>Tick two or more devices.</li><li>Point them at the same static, textured scene and keep them still.</li><li>Press <b>Calibrate</b>.</li><li>Then <b>Point cloud</b> (stereo devices), <b>Panorama</b> or <b>Detections</b>.</li></ol><p style="margin-top:10px;font-size:13px">Devices with a stereo pair use it for the metric scale; otherwise you are asked for a measured camera distance.</p>` + (s.phase === 'error' ? `<p style="margin-top:10px;color:var(--err)">${s.message}</p>` : '');
   }
   if ($('guideCard').innerHTML !== html) $('guideCard').innerHTML = html;
 }
@@ -941,6 +959,7 @@ $('capture').onclick = () => {
   const devices = selectedDevices();
   const chosen = {}; for (const d of devices) if (modes[d]) chosen[d] = modes[d];
   dismissedCapture = null;
+  shownGroup = 1;
   post('/api/capture', { devices, modes: chosen });
 };
 $('pointcloud').onclick = () => post('/api/pointcloud', { devices: selectedDevices() });

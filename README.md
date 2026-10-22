@@ -19,8 +19,9 @@ image-filter-detections tutorial. To use your own updated build: `./install.sh /
 1. Tick two or more devices.
 2. Point them at the same static, textured scene and press **Calibrate**.
 3. Press **Point cloud** (devices with a stereo pair), **Panorama**, or **Detections** (stereo or single-camera devices).
-4. **Capture** saves one synchronized full-resolution frame of every selected camera into `captures/<timestamp>/`
-   (PNG files plus `capture.json` with the timestamps). With PTP it first waits for the frame lock, like the calibration.
+4. **Extras → Capture frames** saves the calibration material to `captures/<timestamp>/`: the same number of
+   synchronized full-resolution image groups the calibration collects, the timestamps in `capture.json` and the factory
+   calibration of every device, so the setup can be calibrated offline. With PTP it first waits for the frame lock.
 4. In **Detections**, view the panorama with merged detections in the embedded visualizer.
    Expand **Detection filters** to change confidence, labels, box area, detection count, or duplicate
    handling (**Off**, **NMS**, **Average**), then press **Apply filters** while running. Filters also

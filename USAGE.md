@@ -84,15 +84,20 @@ retain parallax errors; evaluate merging with more distant objects and overlappi
 a full 360-degree panorama seam are unsupported. This demonstrates image detection merging, without
 cross-camera tracking IDs or depth-aware spatial fusion.
 
-### Capture
+### Capture frames (Extras)
 
-**Capture** (one or more devices, no calibration needed) saves one synchronized full-resolution frame of every selected
-camera: the stereo pair or the single camera chosen under each device, as for the calibration. It streams the cameras,
-lets the exposure settle and, with PTP, waits for the frame lock exactly like the calibration (`--warmup-seconds`,
-`--ptp-settle-ms`, `--ptp-settle-timeout`), then takes the next synchronized group. The frames are saved as PNG in
-`captures/<date>-<time>/` together with `capture.json` (device, socket, size, sequence number, the three timestamps of
-every frame, its offset to the earliest frame of the group in ms, the group spread and the PTP state). The page shows the
-result with the offsets; click a frame for the full-resolution PNG.
+**Capture frames** under **Extras** (one or more devices, no calibration needed) saves the material of a calibration
+to disk so the setup can be calibrated offline: `--sample-count` synchronized full-resolution image groups (default 10,
+the number the calibration collects) of the selected cameras, the stereo pair or the single camera chosen under each
+device. It streams the cameras, lets the exposure settle and, with PTP, waits for the frame lock exactly like the
+calibration (`--warmup-seconds`, `--ptp-settle-ms`, `--ptp-settle-timeout`), then takes one fresh synchronized group
+after another; keep the devices still and looking at the same textured scene meanwhile.
+
+Everything goes to `captures/<date>-<time>/`: `group_01/` … `group_NN/` with one PNG per camera, `calibration_<device
+id>.json` with the factory calibration (intrinsics, stereo extrinsics) of every device, and `capture.json` listing the
+devices (id, product, sockets, stereo pair, calibration file) and, for every frame, device, socket, size, sequence number,
+the three timestamps, its offset to the earliest frame of its group in ms, plus the spread of every group and the PTP
+state. The page shows the result one group at a time with the offsets; click a frame for the full-resolution PNG.
 
 Full resolution cannot stream continuously from several cameras over a 100 Mbit link, so every camera keeps its newest
 frames on the device and only the chosen frame crosses the network. Only small per-frame timestamp messages and 2 FPS
