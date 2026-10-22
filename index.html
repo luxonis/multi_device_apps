@@ -30,6 +30,19 @@
   .modal input[type=number] { flex:0 0 110px; }
   .modal .same { font-size:13px; color:var(--muted); margin:10px 0 14px; display:flex; gap:8px; align-items:center; }
   .modal .actions { justify-content:flex-end; margin-top:12px; }
+  .modal.narrow { width:min(460px, 94vw); padding:22px 24px 18px; }
+  .modal.narrow h3 { margin-bottom:14px; }
+  .settings { display:flex; flex-direction:column; gap:16px; }
+  .settings section { display:flex; flex-direction:column; }
+  .settings h4 { margin:0 0 4px; font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .settings .row { display:flex; align-items:center; gap:10px; margin:0; padding:5px 0; border-top:1px solid var(--line); }
+  .settings section .row:first-of-type { border-top:0; }
+  .settings .row label { flex:1; width:auto; font:inherit; font-size:13px; color:var(--text); }
+  .settings .row input, .settings .row select { flex:0 0 118px; width:118px; font:inherit; font-size:13px; padding:5px 8px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--text); text-align:right; }
+  .settings .row select { text-align:left; }
+  .settings .unit { flex:0 0 22px; font-size:12px; color:var(--muted); }
+  .settings .foot { display:flex; align-items:center; gap:8px; margin-top:4px; }
+  .settings .note { flex:1; font-size:11.5px; color:var(--muted); line-height:1.35; }
   @keyframes pulse { 50% { opacity:.4 } }
   main { flex:1; display:grid; grid-template-columns:400px 1fr; min-height:0; }
   aside { background:var(--panel); border-right:1px solid var(--line); padding:14px 16px; overflow:auto; display:flex; flex-direction:column; gap:14px; }
@@ -248,23 +261,30 @@
   </div>
 </div>
 <div class="modal-backdrop" id="settingsModal" hidden>
-  <div class="modal">
+  <div class="modal narrow">
     <h3>Settings</h3>
-    <p>Apply to the next job and are kept in <code>settings.json</code>. Options given explicitly on the command line keep precedence.</p>
-    <form id="settingsForm">
-      <fieldset class="filters">
-        <label>Panorama projection<select id="setProjection"><option value="cylindrical">Cylindrical</option><option value="spherical">Spherical</option><option value="perspective">Perspective</option></select></label>
-        <label>Image groups per calibration<input id="setSampleCount" type="number" min="1" max="100" step="1" required></label>
-        <label>Image groups per Capture frames<input id="setCaptureGroups" type="number" min="1" max="100" step="1" placeholder="Same as calibration"></label>
-        <label>Exposure warm-up (s)<input id="setWarmup" type="number" min="0" max="60" step="0.5" required></label>
-        <label>PTP lock: frame spread below (ms)<input id="setPtpSettleMs" type="number" min="0.1" max="100" step="0.1" required></label>
-        <label>PTP lock: give up after (s)<input id="setPtpTimeout" type="number" min="1" max="300" step="1" required></label>
-        <label>NeuralDepth model<select id="setModel"><option>LARGE</option><option>MEDIUM</option><option>SMALL</option></select></label>
-        <label>Depth size (W H)<input id="setSize" placeholder="Model size (768 480)" title="Smaller sizes let more devices stream point clouds over one link, e.g. 384 240 for four"></label>
-        <label>Depth range from (m)<input id="setMinRange" type="number" min="0" max="100" step="0.1" required></label>
-        <label>Depth range to (m)<input id="setMaxRange" type="number" min="0.1" max="1000" step="0.5" required></label>
-      </fieldset>
-      <div class="actions">
+    <form id="settingsForm" class="settings">
+      <section>
+        <h4>Panorama</h4>
+        <div class="row"><label for="setProjection">Projection</label><select id="setProjection"><option value="cylindrical">Cylindrical</option><option value="spherical">Spherical</option><option value="perspective">Perspective</option></select><span class="unit"></span></div>
+      </section>
+      <section>
+        <h4>Calibration and capture</h4>
+        <div class="row"><label for="setSampleCount">Image groups per calibration</label><input id="setSampleCount" type="number" min="1" max="100" step="1" required><span class="unit"></span></div>
+        <div class="row"><label for="setCaptureGroups">Image groups per capture</label><input id="setCaptureGroups" type="number" min="1" max="100" step="1" placeholder="same"><span class="unit"></span></div>
+        <div class="row"><label for="setWarmup">Exposure warm-up</label><input id="setWarmup" type="number" min="0" max="60" step="0.5" required><span class="unit">s</span></div>
+        <div class="row"><label for="setPtpSettleMs">PTP lock, frame spread below</label><input id="setPtpSettleMs" type="number" min="0.1" max="100" step="0.1" required><span class="unit">ms</span></div>
+        <div class="row"><label for="setPtpTimeout">PTP lock, give up after</label><input id="setPtpTimeout" type="number" min="1" max="300" step="1" required><span class="unit">s</span></div>
+      </section>
+      <section>
+        <h4>Point cloud</h4>
+        <div class="row"><label for="setModel">NeuralDepth model</label><select id="setModel"><option>LARGE</option><option>MEDIUM</option><option>SMALL</option></select><span class="unit"></span></div>
+        <div class="row"><label for="setSize">Depth size, width and height</label><input id="setSize" placeholder="model size" title="Blank: the model size (768 480 for LARGE). Smaller sizes let more devices stream, e.g. 384 240 for four."><span class="unit">px</span></div>
+        <div class="row"><label for="setMinRange">Range from</label><input id="setMinRange" type="number" min="0" max="100" step="0.1" required><span class="unit">m</span></div>
+        <div class="row"><label for="setMaxRange">Range to</label><input id="setMaxRange" type="number" min="0.1" max="1000" step="0.5" required><span class="unit">m</span></div>
+      </section>
+      <div class="foot">
+        <span class="note">Applies to the next job. Kept in settings.json; command-line options win.</span>
         <button type="button" id="settingsCancel">Cancel</button>
         <button class="primary" type="submit">Save</button>
       </div>
