@@ -272,16 +272,16 @@
         <h4>Calibration and capture</h4>
         <div class="row"><label for="setSampleCount">Image groups per calibration</label><input id="setSampleCount" type="number" min="1" max="100" step="1" required><span class="unit"></span></div>
         <div class="row"><label for="setCaptureGroups">Image groups per capture</label><input id="setCaptureGroups" type="number" min="1" max="100" step="1" placeholder="same"><span class="unit"></span></div>
-        <div class="row"><label for="setWarmup">Exposure warm-up</label><input id="setWarmup" type="number" min="0" max="60" step="0.5" required><span class="unit">s</span></div>
-        <div class="row"><label for="setPtpSettleMs">PTP lock, frame spread below</label><input id="setPtpSettleMs" type="number" min="0.1" max="100" step="0.1" required><span class="unit">ms</span></div>
-        <div class="row"><label for="setPtpTimeout">PTP lock, give up after</label><input id="setPtpTimeout" type="number" min="1" max="300" step="1" required><span class="unit">s</span></div>
+        <div class="row"><label for="setWarmup">Exposure warm-up</label><input id="setWarmup" type="number" min="0" max="60" step="any" required><span class="unit">s</span></div>
+        <div class="row"><label for="setPtpSettleMs">PTP lock, frame spread below</label><input id="setPtpSettleMs" type="number" min="0.1" max="100" step="any" required><span class="unit">ms</span></div>
+        <div class="row"><label for="setPtpTimeout">PTP lock, give up after</label><input id="setPtpTimeout" type="number" min="1" max="300" step="any" required><span class="unit">s</span></div>
       </section>
       <section>
         <h4>Point cloud</h4>
         <div class="row"><label for="setModel">NeuralDepth model</label><select id="setModel"><option>LARGE</option><option>MEDIUM</option><option>SMALL</option></select><span class="unit"></span></div>
         <div class="row"><label for="setSize">Depth size, width and height</label><input id="setSize" placeholder="model size" title="Blank: the model size (768 480 for LARGE). Smaller sizes let more devices stream, e.g. 384 240 for four."><span class="unit">px</span></div>
-        <div class="row"><label for="setMinRange">Range from</label><input id="setMinRange" type="number" min="0" max="100" step="0.1" required><span class="unit">m</span></div>
-        <div class="row"><label for="setMaxRange">Range to</label><input id="setMaxRange" type="number" min="0.1" max="1000" step="0.5" required><span class="unit">m</span></div>
+        <div class="row"><label for="setMinRange">Range from</label><input id="setMinRange" type="number" min="0" max="100" step="any" required><span class="unit">m</span></div>
+        <div class="row"><label for="setMaxRange">Range to</label><input id="setMaxRange" type="number" min="0.1" max="1000" step="any" required><span class="unit">m</span></div>
       </section>
       <div class="foot">
         <span class="note">Applies to the next job. Kept in settings.json; command-line options win.</span>
