@@ -170,10 +170,13 @@
       <p style="font-size:12px;color:var(--muted);margin-bottom:0">Filters apply to the panorama and each source view. Label IDs are comma separated. Off keeps duplicates; NMS chooses one; Average merges them across cameras in the panorama.</p>
       <p id="detectionsRequirement" style="font-size:12px;color:var(--warn)" hidden>Install the updated DepthAI wheel for Detections; see USAGE.md.</p>
     </details>
-    <details class="fold" data-key="extras">
-      <summary><h2>Extras</h2></summary>
-      <p style="font-size:12.5px;color:var(--muted);margin:6px 0 8px">Saves the calibration material to disk: the same number of synchronized full-resolution image groups the calibration collects, from the cameras chosen under each device, plus the factory calibration of every device. With PTP it waits for the frame lock first. Written to <code>captures/</code>.</p>
-      <button id="capture" title="Save synchronized image groups of the selected cameras into captures/ for an offline calibration">Capture frames</button>
+    <details class="fold" data-key="capture">
+      <summary><h2>Capture</h2></summary>
+      <p style="font-size:12.5px;color:var(--muted);margin:6px 0 8px">Saves to <code>captures/</code>, after the PTP frame lock. <b>Frames</b>: the calibration material, the same number of synchronized full-resolution image groups the calibration collects from the cameras chosen under each device, plus the factory calibration of every device. <b>Point cloud</b>: one merged point cloud of the selected stereo devices in the calibration origin as PLY, plus every device's cloud (needs a calibration).</p>
+      <div class="actions">
+        <button id="capture" title="Save synchronized image groups of the selected cameras into captures/ for an offline calibration">Capture frames</button>
+        <button id="capturePointcloud" title="Save one merged point cloud of the selected stereo devices as PLY (needs a calibration)">Capture point cloud</button>
+      </div>
     </details>
     <section>
       <div class="status-card" id="statusCard">
@@ -195,6 +198,10 @@
     <section class="metrics" id="metricsSection" hidden>
       <h2>Result</h2>
       <div id="metrics"></div>
+      <details class="fold" data-key="poses" style="margin-top:8px">
+        <summary><h2>Poses and distances</h2></summary>
+        <div id="poses"></div>
+      </details>
     </section>
     <details class="fold" id="calSection" data-key="calibrations" hidden>
       <summary><h2>Calibrations <span class="count" id="calCount"></span></h2></summary>
@@ -310,6 +317,17 @@ function renderCapture(s) {
   const show = !!c && s.lastJob === 'capture' && !s.busy && dismissedCapture !== c.dir;
   box.hidden = !show;
   if (!show) { renderedCapture = ''; return false; }
+  if (c.kind === 'pointcloud') {
+    if (renderedCapture === c.dir) return true;
+    renderedCapture = c.dir;
+    box.style.gridTemplateColumns = '1fr';
+    const sync = c.ptp && c.ptp.active ? (c.ptp.settled ? 'PTP locked' : 'PTP not settled') : 'no PTP';
+    const rows = [['merged.ply', `${c.merged.points.toLocaleString()} points, all devices in the origin ${c.origin}`], ...c.clouds.map(x => [x.file, `${x.points.toLocaleString()} points, ${x.device} (seq ${x.sequenceNum})`])];
+    box.innerHTML = `<div class="title">Point cloud capture ${c.time}: ${c.merged.points.toLocaleString()} points, timestamp spread ${c.spreadMs.toFixed(2)} ms (${sync}), NeuralDepth ${c.model} at ${c.size[0]}×${c.size[1]}, saved in captures/${c.dir}. <button class="small" id="captureClose">Close</button></div>`
+      + `<div class="title" style="font-family:monospace;line-height:1.7">${rows.map(([f, d]) => `<a href="/api/capture/${encodeURIComponent(c.dir)}/${encodeURIComponent(f)}" style="color:#d6dde6">${f}</a> · ${d}`).join('<br>')}</div>`;
+    $('captureClose').onclick = () => { dismissedCapture = c.dir; render(state); };
+    return true;
+  }
   const group = c.groups.find(g => g.index === shownGroup) || c.groups[0];
   const key = `${c.dir}:${group.index}`;
   if (renderedCapture === key) return true;
@@ -463,11 +481,12 @@ function updateButtons() {
   const n = selected.size;
   const inspected = selectedDevices().filter(d => state.deviceInfo[d]).length;
   $('devCount').textContent = busy && state.jobDevices && state.jobDevices.length ? `· ${state.jobDevices.length} in use` : n ? `· ${n} selected${inspected ? `, ${inspected} checked` : ''}` : '';
+  const covered = n >= 2 && hasCalibration(selectedDevices());
+  const stereo = selectedDevices().every(d => !state.deviceInfo[d] || state.deviceInfo[d].stereoPair);
   $('inspect').disabled = busy || n < 1;
   $('calibrate').disabled = busy || n < 2;
   $('capture').disabled = busy || n < 1;
-  const covered = n >= 2 && hasCalibration(selectedDevices());
-  const stereo = selectedDevices().every(d => !state.deviceInfo[d] || state.deviceInfo[d].stereoPair);
+  $('capturePointcloud').disabled = busy || !covered || !stereo;
   $('pointcloud').disabled = busy || !covered || !stereo;
   $('pointcloud').title = n >= 2 && !covered ? 'Calibrate these devices first' : !stereo ? 'Every device needs a stereo pair' : 'Merged point cloud of the selected devices';
   $('panorama').disabled = busy || !covered;
@@ -501,8 +520,9 @@ function renderMetrics(c) {
   if (c.samples != null) stats.push([c.samples, 'samples', `${c.samples} image groups${c.collectSeconds != null ? `, collected in ${c.collectSeconds} s` : ''}`]);
   if (c.ptp) stats.push([c.ptp.active ? (c.ptp.spreadMs != null ? `${c.ptp.spreadMs} ms` : 'on') : 'off', 'PTP', c.ptp.active ? 'frame timestamp spread between the devices' : 'calibrated without PTP']);
   if (c.previous && c.previous.maxTranslation_cm != null) stats.push([`${c.previous.maxTranslation_cm} cm / ${c.previous.maxRotation_deg}°`, 'vs previous', `largest pose change against the calibration of ${c.previous.time}`, c.previous.maxTranslation_cm < 2 && c.previous.maxRotation_deg < 1 ? 'good' : 'fair']);
-  let html = `<div class="stats">${stats.map(([v, k, title, cls]) => `<div title="${title}"><b class="${cls || ''}">${v}</b><span>${k}</span></div>`).join('')}</div>`;
-  html += `<table><tr><th>Device</th><th class="num">x, y, z [m]</th><th class="num">dist</th><th class="num">rot</th></tr>`;
+  const summary = `<div class="stats">${stats.map(([v, k, title, cls]) => `<div title="${title}"><b class="${cls || ''}">${v}</b><span>${k}</span></div>`).join('')}</div>`;
+  if ($('metrics').innerHTML !== summary) $('metrics').innerHTML = summary;
+  let html = `<table><tr><th>Device</th><th class="num">x, y, z [m]</th><th class="num">dist</th><th class="num">rot</th></tr>`;
   for (const d of c.devices) {
     html += `<tr title="${d.deviceId}${d.cameras.length ? ' · ' + d.cameras.map(x => x.socket).join(' + ') : ''}${d.ypr_deg ? ' · yaw/pitch/roll ' + d.ypr_deg.join(' / ') + '°' : ''}"><td>${d.name}${d.isOrigin ? ' ' + chip('origin') : ''}</td><td class="num">${d.translation_m.map(v => v.toFixed(3)).join(', ')}</td><td class="num">${d.distance_m.toFixed(3)} m</td><td class="num">${d.rotation_deg.toFixed(1)}°</td></tr>`;
   }
@@ -518,7 +538,7 @@ function renderMetrics(c) {
     for (const p of c.pairs) html += `<tr><td>${p.a} ↔ ${p.b}</td><td class="num">${fmt(p.origin_distance_cm, 1)} cm</td></tr>`;
     html += '</table>';
   }
-  if ($('metrics').innerHTML !== html) $('metrics').innerHTML = html;
+  if ($('poses').innerHTML !== html) $('poses').innerHTML = html;
 }
 
 function render(s) {
@@ -962,6 +982,7 @@ $('capture').onclick = () => {
   shownGroup = 1;
   post('/api/capture', { devices, modes: chosen });
 };
+$('capturePointcloud').onclick = () => { dismissedCapture = null; post('/api/capture/pointcloud', { devices: selectedDevices() }); };
 $('pointcloud').onclick = () => post('/api/pointcloud', { devices: selectedDevices() });
 $('panorama').onclick = () => post('/api/panorama', { devices: selectedDevices(), projection: $('projection').value });
 $('detections').onclick = () => {

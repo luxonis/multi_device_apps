@@ -87,6 +87,49 @@ while True:
         node.io['out'].send(f if f is not None else req)
     time.sleep(0.005)
 """.replace("RING", str(CAPTURE_RING))
+# Runs on every device of a point cloud capture: keeps the newest aligned depth and color frames by device timestamp and
+# sends the pair closest to the requested timestamp (within half a frame period) to the host, waiting for the depth of
+# that slot to arrive (depth lags the tick by the NeuralDepth latency), or echoes the request when the pair never comes
+# (depth pauses for a few seconds after start while PTP re-times the stereo sensors)
+CAPTURE_CLOUD_SCRIPT = """
+import time
+depth = {}
+color = {}
+pending = None  # (request, target timestamp ms, since): depth lags the tick by the NeuralDepth latency, so a request waits for it
+def push(store, f):
+    store[int(f.getTimestampDevice().total_seconds() * 1000)] = f
+    while len(store) > RING:
+        del store[min(store)]
+def nearest(store, target):
+    best = None
+    for ts in store:
+        if abs(ts - target) <= TOL and (best is None or abs(ts - target) < abs(best - target)):
+            best = ts
+    return None if best is None else store[best]
+while True:
+    f = node.io['depth'].tryGet()
+    if f is not None:
+        push(depth, f)
+    f = node.io['color'].tryGet()
+    if f is not None:
+        push(color, f)
+    req = node.io['request'].tryGet()
+    if req is not None:
+        pending = (req, int(bytes(req.getData()).decode()), time.time())
+    if pending is not None:
+        req, target, since = pending
+        d = nearest(depth, target)
+        c = nearest(color, target)
+        if d is not None and c is not None:
+            node.io['depth_out'].send(d)
+            node.io['color_out'].send(c)
+            pending = None
+        elif (depth and max(depth) > target + TOL) or time.time() - since > 2.0:
+            node.error('no depth and color for slot %d: depth %s color %s' % (target, sorted(depth)[-3:], sorted(color)[-3:]))
+            node.io['depth_out'].send(req)
+            pending = None
+    time.sleep(0.005)
+""".replace("RING", str(CAPTURE_RING))
 PTP_WARNING = "Devices are not PTP-synchronized: the calibration may be less precise."
 NO_SCALE_WARNING = "No device provides a stereo pair, so the metric scale must come from a measured distance between two cameras."
 
@@ -181,6 +224,31 @@ def extrinsics_matrix(ext):
     t = ext.translation
     scale = {dai.LengthUnit.METER: 1.0, dai.LengthUnit.CENTIMETER: 0.01, dai.LengthUnit.MILLIMETER: 0.001}.get(ext.lengthUnit, 1.0)
     return pose_matrix(ext.rotationMatrix, [t.x * scale, t.y * scale, t.z * scale])
+
+
+def write_ply(path, points, colors):
+    """Binary little-endian PLY with float32 xyz (meters) and uint8 rgb."""
+    data = np.empty(len(points), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+    data["x"], data["y"], data["z"] = points[:, 0], points[:, 1], points[:, 2]
+    data["red"], data["green"], data["blue"] = colors[:, 0], colors[:, 1], colors[:, 2]
+    header = (f"ply\nformat binary_little_endian 1.0\ncomment multi-device app point cloud, meters, calibration origin frame\nelement vertex {len(points)}\n"
+              "property float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+    with open(path, "wb") as f:
+        f.write(header.encode("ascii"))
+        f.write(data.tobytes())
+
+
+def cloud_arrays(cloud):
+    """(points (N, 3) float32, colors (N, 3) uint8) of a PointCloudData without the invalid (all-zero) points."""
+    if cloud.isColor():
+        points, colors = cloud.getPointsRGB()
+        colors = np.asarray(colors)[:, :3]
+    else:
+        points = cloud.getPoints()
+        colors = np.full((len(points), 3), 255, dtype=np.uint8)
+    points = np.asarray(points, dtype=np.float32)
+    valid = np.isfinite(points).all(axis=1) & np.any(points != 0, axis=1)
+    return np.ascontiguousarray(points[valid]), np.ascontiguousarray(colors[valid].astype(np.uint8))
 
 
 def seconds(timestamp):
@@ -1197,7 +1265,7 @@ class App:
             ptp_summary = {"active": self.ptp["active"], "settled": self.ptp["settled"], "master": self.ptp["master"], "warning": self.ptp["warning"]}
         spread_max = max(g["spreadMs"] for g in saved_groups)
         info = {
-            "dir": folder.name, "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), "fps": args.fps,
+            "kind": "frames", "dir": folder.name, "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), "fps": args.fps,
             "sampleCount": args.sample_count, "spreadMaxMs": round(spread_max, 3), "ptp": ptp_summary,
             "devices": [{"name": name, "deviceId": device_ids[name], "product": self.device_info[name]["productName"], "sockets": registered[name],
                          "stereoPair": self.device_info[name]["stereoPair"] if len(registered[name]) == 2 else None, "calibrationFile": calibration_files.get(name)} for name in device_names],
@@ -1213,6 +1281,200 @@ class App:
         sync_label = "PTP locked" if ptp_summary["settled"] else "PTP not settled" if ptp else "no PTP"
         self.log(f"Captured {len(saved_groups)} groups ({frames_total} frames, spread up to {spread_max:.2f} ms, {sync_label}) and {len(calibration_files)} device calibrations into captures/{folder.name}")
         self.set_state("idle", f"Captured {len(saved_groups)} image groups ({frames_total} frames, spread up to {spread_max:.2f} ms, {sync_label}) into captures/{folder.name}.", progress=None)
+
+    def capture_pointcloud_async(self, device_names):
+        return self._start_job(self._capture_pointcloud, device_names, name="capture")
+
+    def _capture_pointcloud(self, device_names):
+        """Saves one merged point cloud of the selected stereo devices as PLY (the Point cloud pipeline: NeuralDepth per
+        device, every cloud in the calibration origin), plus the cloud of every device, once the frames have locked."""
+        args = self.args
+        model = getattr(dai.DeviceModelZoo, f"NEURAL_DEPTH_{args.model}")
+        size = tuple(args.size) if args.size else tuple(dai.node.NeuralDepth.getInputSize(model))
+        self.set_state("capturing", "Checking the devices...", progress={"stage": "inspecting", "done": 0, "total": 1, "percent": None}, stats=None)
+        self.log(f"Point cloud capture of {device_names} started (NeuralDepth {args.model}, {args.pc_fps:g} FPS)")
+        device_ids, calibration = self._require_calibration(device_names)
+        for name in device_names:
+            if not self.device_info[name]["stereoPair"]:
+                raise RuntimeError(f"{name} has no stereo pair, so it cannot produce depth.")
+        self.set_state("capturing", progress={"stage": "ptp", "done": 0, "total": 1, "percent": None})
+        ptp = self._prepare_ptp(device_names)
+        if self.stop_event.is_set():
+            self.set_state("idle", "Capture stopped.", progress=None)
+            return
+        self.set_state("capturing", "Connecting to devices...", progress={"stage": "connecting", "done": 0, "total": 1, "percent": None})
+        handler = dai.beta.MultiDeviceCalibrationHandler(Path(calibration["path"]))
+        self.log(f"Using calibration {Path(calibration['path']).name}")
+        clouds = None
+        spread_ms = None
+        tolerance_ms = int(500.0 / args.pc_fps)  # half a frame period: the depth and color frames of one capture slot
+        with dai.Pipeline(createImplicitDevice=False) as pipeline:
+            pipeline.setAutoCalibrationMode(dai.Pipeline.AutoCalibrationMode.OFF)
+            devices = [pipeline.addDevice(dai.DeviceInfo(name)) for name in device_names]
+            for device in devices:
+                device.setLogOutputLevel(dai.LogLevel.ERR)  # the on-device stereo sync warns for seconds while PTP locks the sensors
+            # The aligned frames carry the extrinsics rebased onto the common origin device, which the host PointCloud nodes apply
+            pipeline.setMultiDeviceCalibration(handler.getGraph())
+            # Several devices' depth and color at the depth size do not fit through a gigabit link in step, so every device
+            # keeps its newest aligned depth and color frames on the device and only tiny tick frames of the color camera
+            # stream for the spread monitor; after the lock one slot is pulled and converted into clouds on the host
+            monitor = self._monitor_sync(pipeline, args.pc_fps, ptp)
+            streams = {}  # device id -> (request queue, depth queue, color queue, cloud depth queue, cloud color queue, cloud queue)
+            for name, device, device_id in zip(device_names, devices, device_ids):
+                info = self.device_info[name]
+                if not device.isNeuralDepthSupported():
+                    raise RuntimeError(f"{name} does not support NeuralDepth")
+                left_socket, right_socket = (socket_from_name(s) for s in info["stereoPair"])
+                left = pipeline.create(dai.node.Camera, device).build(left_socket, sensorFps=args.pc_fps)
+                right = pipeline.create(dai.node.Camera, device).build(right_socket, sensorFps=args.pc_fps)
+                color_socket = self._color_socket(info)
+                color = pipeline.create(dai.node.Camera, device).build(color_socket, sensorFps=args.pc_fps)
+                color.setOutputsNumFramesPool(2 * CAPTURE_RING)  # the ring holds CAPTURE_RING color frames
+                for camera in (left, right, color):
+                    if ptp:
+                        camera.initialControl.setFrameSyncMode(dai.CameraControl.FrameSyncMode.TIME_PTP)
+                neural = pipeline.create(dai.node.NeuralDepth, device).build(left.requestFullResolutionOutput(fps=args.pc_fps), right.requestFullResolutionOutput(fps=args.pc_fps), model)
+                neural.initialConfig.postProcessing.thresholdFilter.minRange = int(args.min_range * 1000)
+                neural.initialConfig.postProcessing.thresholdFilter.maxRange = int(args.max_range * 1000)
+                color_out = color.requestOutput(size, type=dai.ImgFrame.Type.RGB888i, fps=args.pc_fps, resizeMode=dai.ImgResizeMode.CROP, enableUndistortion=True)
+                align = pipeline.create(dai.node.ImageAlign, device)
+                align.setNumFramesPool(2 * CAPTURE_RING)  # the ring holds CAPTURE_RING aligned frames
+                neural.depth.link(align.input)
+                color_out.link(align.inputAlignTo)
+                ring = pipeline.create(dai.node.Script, device)
+                ring.setScript(CAPTURE_CLOUD_SCRIPT.replace("TOL", str(tolerance_ms)))
+                for input_name, output in (("depth", align.outputAligned), ("color", color_out)):
+                    ring.inputs[input_name].setBlocking(False)
+                    ring.inputs[input_name].setMaxSize(4)
+                    output.link(ring.inputs[input_name])
+                monitor_input = monitor.inputs[device_id]
+                monitor_input.setBlocking(False)
+                monitor_input.setMaxSize(8)
+                color.requestOutput(CAPTURE_TICK_SIZE, fps=args.pc_fps).link(monitor_input)
+                pc = pipeline.create(dai.node.PointCloud)
+                pc.setRunOnHost(True)
+                pc.useCPUMT(args.threads)
+                pc.initialConfig.setLengthUnit(dai.LengthUnit.METER)
+                streams[device_id] = (ring.inputs["request"].createInputQueue(), ring.outputs["depth_out"].createOutputQueue(maxSize=4, blocking=False),
+                                      ring.outputs["color_out"].createOutputQueue(maxSize=4, blocking=False), pc.inputDepth.createInputQueue(),
+                                      pc.inputColor.createInputQueue(), pc.outputPointCloud.createOutputQueue(maxSize=4, blocking=False))
+                self.log(f"{name}: NeuralDepth {args.model} on {info['stereoPair'][0]}+{info['stereoPair'][1]}, aligned to {color_socket.name} {size[0]}x{size[1]}")
+            group_queue = monitor.out.createOutputQueue(maxSize=8, blocking=False)
+            pipeline.start()
+            try:
+                self._wait_for_lock(pipeline, group_queue, ptp, 1, "Capturing")
+                self.set_state(message="Capturing the point clouds...", progress={"stage": "capturing", "done": 0, "total": 1, "percent": None, "detail": "fetching the depth and color frames of one capture slot"})
+                frames = None
+                for attempt in range(1, 11):
+                    group_queue.tryGetAll()  # a fresh slot whose frames are still in the rings
+                    group = None
+                    deadline = time.monotonic() + max(5.0, 5 * 1000.0 / args.pc_fps)
+                    while pipeline.isRunning() and not self.stop_event.is_set() and time.monotonic() < deadline:
+                        group = group_queue.tryGet()
+                        if group is not None:
+                            break
+                        time.sleep(0.02)
+                    if self.stop_event.is_set():
+                        raise InterruptedError
+                    if group is None:
+                        raise RuntimeError("No synchronized frame group arrived: the cameras are not delivering frames in step.")
+                    spread_ms = group.getIntervalNs() / 1e6
+                    self.set_ptp(spreadMs=round(spread_ms, 2), spreadAt=time.monotonic())
+                    targets = {device_id: int(seconds(group[device_id].getTimestampDevice()) * 1000) for device_id in device_ids}
+                    for device_id, (request_queue, *_) in streams.items():
+                        request = dai.Buffer()
+                        request.setData(list(str(targets[device_id]).encode()))
+                        request_queue.send(request)
+                    frames = {}
+                    missing = []
+                    deadline = time.monotonic() + 30.0
+                    pending = set(device_ids)
+                    while pending and pipeline.isRunning() and not self.stop_event.is_set() and time.monotonic() < deadline:
+                        for device_id in list(pending):
+                            _, depth_queue, color_queue, *_ = streams[device_id]
+                            message = depth_queue.tryGet()
+                            if message is None:
+                                continue
+                            if not isinstance(message, dai.ImgFrame):
+                                missing.append(device_id)
+                                pending.discard(device_id)
+                                continue
+                            color_frame = color_queue.get(timedelta(seconds=5))
+                            if color_frame is None:
+                                raise RuntimeError(f"{device_id}: the color frame did not follow the depth frame")
+                            frames[device_id] = (message, color_frame)
+                            pending.discard(device_id)
+                        time.sleep(0.02)
+                    if self.stop_event.is_set():
+                        raise InterruptedError
+                    if pending:
+                        raise RuntimeError(f"Frames of {', '.join(pending)} did not arrive within 30 s.")
+                    if not missing:
+                        break
+                    names = [name for name, device_id in zip(device_names, device_ids) if device_id in missing]
+                    self.log(f"Attempt {attempt}: no depth yet for the slot on {', '.join(names)} (depth pauses while PTP re-times the stereo sensors), trying the next slot")
+                    self.set_state(progress={"stage": "capturing", "done": 0, "total": 1, "percent": None, "detail": f"attempt {attempt}: waiting for depth of {', '.join(names)}"})
+                    frames = None
+                    time.sleep(1.0)
+                if frames is None:
+                    raise RuntimeError("The devices never had depth and color of the same capture slot: are all devices producing depth?")
+                self.set_state(progress={"stage": "capturing", "done": 0, "total": 1, "percent": None, "detail": "converting the frames into point clouds"})
+                clouds = []
+                for name, device_id in zip(device_names, device_ids):
+                    depth_frame, color_frame = frames[device_id]
+                    _, _, _, cloud_depth_queue, cloud_color_queue, cloud_queue = streams[device_id]
+                    cloud_queue.tryGetAll()
+                    cloud_depth_queue.send(depth_frame)
+                    cloud_color_queue.send(color_frame)
+                    cloud = cloud_queue.get(timedelta(seconds=15))
+                    if cloud is None:
+                        raise RuntimeError(f"{name}: the point cloud node produced nothing for the captured frames")
+                    points, colors = cloud_arrays(cloud)
+                    # The pose the point cloud node applied: the depth camera relative to the common origin (rebased calibration)
+                    extrinsics = depth_frame.getTransformation().getExtrinsics()
+                    pose = {"toDeviceId": extrinsics.toDeviceId, "toCameraSocket": socket_name(extrinsics.toCameraSocket), "unit": str(extrinsics.lengthUnit).split(".")[-1],
+                            "matrix": np.asarray(extrinsics.getTransformationMatrix(), dtype=np.float64).round(6).tolist()}
+                    clouds.append({"device": name, "deviceId": device_id, "points": points, "colors": colors, "sequenceNum": depth_frame.getSequenceNum(), "pose": pose,
+                                   "timestamp_s": seconds(depth_frame.getTimestamp()), "timestampDevice_s": seconds(depth_frame.getTimestampDevice()),
+                                   "timestampSystem_s": seconds(depth_frame.getTimestampSystem()), "colorTimestampDevice_s": seconds(color_frame.getTimestampDevice())})
+            except InterruptedError:
+                clouds = None
+            finally:
+                pipeline.stop()
+        if not clouds:
+            self.log("Capture stopped")
+            self.set_state("idle", "Capture stopped.", progress=None)
+            return
+
+        self.set_state(message="Saving the point clouds...", progress={"stage": "saving", "done": 0, "total": 1, "percent": None})
+        now = time.time()
+        folder = CAPTURE_DIR / (time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + "-pointcloud")
+        folder.mkdir(parents=True, exist_ok=True)
+        entries = []
+        source = "timestampSystem_s" if ptp else "timestamp_s"  # the clock the monitor grouped by
+        first = min(c[source] for c in clouds)
+        for c in clouds:
+            file = f"{c['device']}.ply".replace("/", "_").replace(" ", "_")
+            write_ply(folder / file, c["points"], c["colors"])
+            entries.append({**{k: v for k, v in c.items() if k not in ("points", "colors")}, "file": file, "points": len(c["points"]), "offsetMs": round((c[source] - first) * 1000.0, 3)})
+        merged_points = np.concatenate([c["points"] for c in clouds])
+        write_ply(folder / "merged.ply", merged_points, np.concatenate([c["colors"] for c in clouds]))
+        with self.lock:
+            ptp_summary = {"active": self.ptp["active"], "settled": self.ptp["settled"], "master": self.ptp["master"], "warning": self.ptp["warning"]}
+        info = {
+            "kind": "pointcloud", "dir": folder.name, "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+            "calibration": calibration["path"], "origin": calibration["origin"], "model": args.model, "fps": args.pc_fps, "size": list(size),
+            "minRange_m": args.min_range, "maxRange_m": args.max_range, "spreadMs": round(spread_ms, 3), "ptp": ptp_summary,
+            "merged": {"file": "merged.ply", "points": int(len(merged_points))}, "clouds": entries,
+        }
+        (folder / "pointcloud.json").write_text(json.dumps(info, indent=1))
+        with self.lock:
+            self.latest_capture = info
+        for e in entries:
+            self.log(f"{e['device']}: {e['points']} points, depth seq {e['sequenceNum']}, {e['offsetMs']:+.2f} ms -> {e['file']}")
+        sync_label = "PTP locked" if ptp_summary["settled"] else "PTP not settled" if ptp else "no PTP"
+        self.log(f"Captured a merged point cloud of {len(merged_points)} points ({spread_ms:.2f} ms spread, {sync_label}) into captures/{folder.name}")
+        self.set_state("idle", f"Captured a merged point cloud of {len(merged_points):,} points ({spread_ms:.2f} ms spread, {sync_label}) into captures/{folder.name}.", progress=None)
 
     @staticmethod
     def _thumbnail(image, width=640):
@@ -1737,6 +1999,10 @@ class Handler(BaseHTTPRequestHandler):
             if not devices:
                 return self._json({"error": "Select at least one device"}, 400)
             ok = self.app.capture_async(devices, body.get("modes") or {})
+        elif self.path == "/api/capture/pointcloud":
+            if len(devices) < 2:
+                return self._json({"error": "Select at least two devices"}, 400)
+            ok = self.app.capture_pointcloud_async(devices)
         elif self.path == "/api/pointcloud":
             if len(devices) < 2:
                 return self._json({"error": "Select at least two devices"}, 400)

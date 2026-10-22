@@ -84,9 +84,9 @@ retain parallax errors; evaluate merging with more distant objects and overlappi
 a full 360-degree panorama seam are unsupported. This demonstrates image detection merging, without
 cross-camera tracking IDs or depth-aware spatial fusion.
 
-### Capture frames (Extras)
+### Capture
 
-**Capture frames** under **Extras** (one or more devices, no calibration needed) saves the material of a calibration
+**Capture frames** under **Capture** (one or more devices, no calibration needed) saves the material of a calibration
 to disk so the setup can be calibrated offline: `--sample-count` synchronized full-resolution image groups (default 10,
 the number the calibration collects) of the selected cameras, the stereo pair or the single camera chosen under each
 device. It streams the cameras, lets the exposure settle and, with PTP, waits for the frame lock exactly like the
@@ -98,6 +98,16 @@ id>.json` with the factory calibration (intrinsics, stereo extrinsics) of every 
 devices (id, product, sockets, stereo pair, calibration file) and, for every frame, device, socket, size, sequence number,
 the three timestamps, its offset to the earliest frame of its group in ms, plus the spread of every group and the PTP
 state. The page shows the result one group at a time with the offsets; click a frame for the full-resolution PNG.
+
+**Capture point cloud** (two or more calibrated stereo devices) runs the Point cloud pipeline (NeuralDepth per device,
+`--model`, `--size`, `--pc-fps`, `--min-range`, `--max-range`), waits for the exposure and the PTP frame lock, then saves
+one synchronized merged cloud as `captures/<date>-<time>-pointcloud/merged.ply` in the calibration origin, every
+device's own cloud as `<device>.ply` (already in the origin frame, so they overlay directly) and `pointcloud.json`
+with the calibration used, the point counts, timestamps, spread and PTP state. The PLY files are binary with float xyz in
+meters and RGB colors; invalid (zero) points are dropped.
+
+The calibration metrics below the status show the confidence numbers; expand **Poses and distances** for the device
+poses and camera distances.
 
 Full resolution cannot stream continuously from several cameras over a 100 Mbit link, so every camera keeps its newest
 frames on the device and only the chosen frame crosses the network. Only small per-frame timestamp messages and 2 FPS
@@ -118,7 +128,9 @@ disables the check. PTP needs a switch that passes PTP traffic.
 
 - Ports 8093 (app), 8082 (visualizer page) and 8765 (visualizer WebSocket) must be free.
 - Many devices on one network link: `./run.sh --pc-fps 5` or `./run.sh --size 640 400`. All options:
-  `./run.sh --help`.
+  `./run.sh --help`. The live **Point cloud** streams depth and color of every device at the NeuralDepth size; four
+  devices at the default 768×480 need more than a gigabit link and no merged cloud appears, while `--size 384 240`
+  streams at the full rate. **Capture point cloud** is not affected: it keeps the frames on the devices and pulls one slot.
 - If the calibration fails, check that every camera sees the same part of a textured, lit scene; the Log
   section and the terminal output show the details.
 - Stop the app with Ctrl+C in the terminal.
